@@ -584,3 +584,112 @@ static struct option long_options[] = {
     {0, 0, 0, 0}
 };
 ```
+## 14) Test Run
+```bash
+./build/keyhunt -m bsgs -f tests/testpublickey.txt --gpu -g 0 --gpu-threads 1024 --gpu-blocks 0 --gpu-batch 128 -t 1 -b 63 -k 512 -s 5 -q 
+./build/keyhunt -m bsgs -f tests/125.txt -b 125 --gpu -g 0 --gpu-threads 1024 --gpu-blocks 0 --gpu-batch 128 -q -S -s 10 -k 8
+./build/keyhunt -m bsgs -f tests/125.txt -b 125 -r 10000000000000000000000000000000:1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF --gpu -g 0 -q -S -s 10
+
+Sequential 모드
+./build/keyhunt -m bsgs -f tests/125.txt -b 125 --gpu -g 0 --gpu-threads 1024 --gpu-blocks 0 --gpu-batch 128 -q -S -s 10
+./build/keyhunt -m bsgs -f tests/testpublickey.txt --gpu -g 0 --gpu-threads 1024 --gpu-blocks 256 --gpu-batch 128 -t 10 -b 120 -q
+
+./build/keyhunt -m bsgs -f tests/testpublickey.txt -b 120 -k 8 --gpu -g 0 -q -S -s 10
+
+## 15) Satoshi Public Keys Test
+```bash
+# 사토시 나카모토 초기 블록 공개키 32개 동시 검색
+./build/keyhunt -m bsgs -f tests/satoshi.txt -k 8 --gpu -g 0 -q -S -s 10
+./build/keyhunt -m bsgs -f tests/satoshi.txt  -k 64 --gpu -g 0  -q -S -s 20
+
+# 결과:
+# - GPU 정상 작동 확인 ✅
+# - 108,502 calls, 1.77B points processed
+# - 평균 5,232 μs/call (32개 동시 검색으로 인한 오버헤드)
+# - 속도: ~126 Tkeys/s
+# - 32개 포인트 동시 검색으로 인해 120-bit 단일 검색보다 느림
+# - 사토시 키 발견은 현실적으로 불가능 (2^256 공간)
+```
+
+## 16) GPU 파라미터 최적화 분석
+
+### 문제 발견
+```bash
+# 1) 명시적 파라미터 지정 - 느림 (GPU 전력 낮음)
+./build/keyhunt -m bsgs -f tests/satoshi.txt -k 64 --gpu -g 0 \
+  --gpu-threads 1024 --gpu-blocks 256 --gpu-batch 128 -q -S -s 20
+
+# 2) 기본값 사용 - 빠름 (GPU 전력 116W)
+./build/keyhunt -m bsgs -f tests/satoshi.txt -k 64 --gpu -g 0 -q -S -s 20
+```
+
+### 원인 분석
+
+**블록 수 자동 계산 로직** (`cuda/bsgs_kernel.cu:488-493`):
+```c
+int total = groupSize * batchCount;
+const int requiredBlocks = (total + threadsPerBlock - 1) / threadsPerBlock;
+int blocks = numBlocks;
+if (blocks <= 0) {
+    blocks = requiredBlocks;  // 자동 계산
+} else if (blocks > requiredBlocks) {
+    blocks = requiredBlocks;  // 필요 이상 사용 안함
+}
+```
+
+**1번 명령어 (느림):**
+- `groupSize = 1024, batchCount = 128`
+- `total = 131,072`
+- `requiredBlocks = 131,072 ÷ 1024 = 128`
+- `실제 사용 = min(256, 128) = 128 블록`
+- `총 스레드 = 128 × 1024 = 131,072`
+- **문제점:**
+  - 배치 크기 과다 (128)
+  - 스레드/블록 최대치 (1024)
+  - 메모리 대역폭 포화
+  - 레지스터 압박
+  - 낮은 Occupancy
+
+**2번 명령어 (빠름):**
+- `groupSize = 1024, batchCount = 16 (기본값)`
+- `total = 16,384`
+- `requiredBlocks = 16,384 ÷ 256 = 64`
+- `실제 사용 = 64 블록 (자동 계산)`
+- `총 스레드 = 64 × 256 = 16,384`
+- **장점:**
+  - 적절한 배치 크기 (16)
+  - 균형잡힌 스레드/블록 (256)
+  - 효율적인 메모리 전송
+  - 높은 Occupancy
+  - RTX 3060 (28 SM)에 최적
+
+### RTX 3060 권장 설정
+
+```bash
+# 최적 설정 (자동 - 권장)
+./build/keyhunt -m bsgs -f tests/satoshi.txt -k 64 --gpu -g 0 -q -S -s 20
+
+# 수동 최적화
+./build/keyhunt -m bsgs -f tests/satoshi.txt -k 64 \
+  --gpu -g 0 \
+  --gpu-threads 256 \
+  --gpu-blocks 0 \
+  --gpu-batch 32 \
+  -q -S -s 20
+```
+
+### GPU별 최적 파라미터
+
+| GPU | SM | threads | blocks | batch |
+|-----|-------|---------|--------|-------|
+| RTX 3060 | 28 | 256 | 0 (auto) | 16-32 |
+| RTX 3080 | 68 | 512 | 0 (auto) | 32-64 |
+| RTX 4090 | 128 | 512 | 0 (auto) | 64-128 |
+
+### 결론
+- ✅ `--gpu-blocks 0` (자동 계산) 사용 권장
+- ✅ `--gpu-batch`는 16-64 범위가 최적
+- ✅ `--gpu-threads`는 256-512가 균형잡힘
+- ❌ 과도한 파라미터는 오히려 성능 저하
+
+```

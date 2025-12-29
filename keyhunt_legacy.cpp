@@ -6456,6 +6456,12 @@ void menu() {
 	printf("-t tn       Threads number, must be a positive integer\n");
 	printf("-v value    Search for vanity Address, only with -m address and rmd160\n");
 	printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
+	printf("\nGPU Options (CUDA):\n");
+	printf("--gpu              Enable GPU acceleration (CUDA required)\n");
+	printf("-g device          GPU device ID (default: 0)\n");
+	printf("--gpu-threads N    Threads per block (default: 256, range: 32-1024)\n");
+	printf("--gpu-blocks N     Number of blocks (default: 0=auto, recommended)\n");
+	printf("--gpu-batch N      Batch size (default: 16, range: 1-1024)\n");
 	printf("\nExample:\n\n");
 	printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
 	printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");

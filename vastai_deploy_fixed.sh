@@ -12,10 +12,11 @@ set -e
 
 DISCORD_WEBHOOK="https://discord.com/api/webhooks/1357451751908839576/qDswrcM9eK9zE02SWFQqIOA7068OTZWgdbsJ7_7END4cLgH57En7mj5TTIuQToBaJWCJ"
 
-# Puzzle 71 공개키 (BSGS 모드 사용 가능!)
-PUZZLE71_PUBKEY="0296b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52"
-TARGET_ADDRESS="1J6PYEzr4CUoGbnXrELyHszoTSz3wCsCaj"
+# 파일 경로
+WORK_DIR="/home/park"
 
+# Puzzle 71
+TARGET_FILE="${WORK_DIR}/keyhuntM1CPU/tests/target.txt"
 BIT_RANGE=71
 
 # GPU 설정 (RTX 5090 기준)
@@ -26,8 +27,7 @@ CPU_THREADS=1          # GPU 모드에서는 1 권장
 
 STATS_INTERVAL=60
 
-# 파일 경로
-WORK_DIR="/home/park"
+# 로그 파일 경로
 LOG_FILE="${WORK_DIR}/keyhunt_puzzle71.log"
 RESULT_FILE="${WORK_DIR}/keyhunt_FOUND.txt"
 CHECKPOINT_FILE="${WORK_DIR}/keyhunt_checkpoint.txt"
@@ -56,14 +56,14 @@ send_discord() {
     curl -s -H "Content-Type: application/json" \
         -d "{
             \"embeds\": [{
-                \"title\": \"🔑 $title\",
+                \"title\": \"\u{1F510} $title\",
                 \"description\": \"$message\",
                 \"color\": $color,
                 \"fields\": [
                     {\"name\": \"Machine\", \"value\": \"$hostname\", \"inline\": true},
                     {\"name\": \"GPU\", \"value\": \"$gpu_info\", \"inline\": true},
                     {\"name\": \"Ranges\", \"value\": \"$searched_ranges\", \"inline\": true},
-                    {\"name\": \"Target\", \"value\": \"\`$TARGET_ADDRESS\`\", \"inline\": false}
+                    {\"name\": \"Target\", \"value\": \"\`$(cat $TARGET_FILE 2>/dev/null || echo 'N/A')\`\", \"inline\": false}
                 ],
                 \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
             }]
@@ -187,9 +187,14 @@ build_keyhunt() {
 # ============================================================================
 
 create_target_file() {
-    # BSGS 모드는 공개키 필요
-    echo "$PUZZLE71_PUBKEY" > "${WORK_DIR}/puzzle71_target.txt"
-    echo "[INFO] Target file created (PUBLIC KEY for GPU BSGS)"
+    # TARGET_FILE이 존재하는지 확인
+    if [ ! -f "$TARGET_FILE" ]; then
+        echo "[ERROR] Target file not found: $TARGET_FILE"
+        echo "[INFO] Please create $TARGET_FILE with target addresses or public keys"
+        exit 1
+    fi
+    echo "[INFO] Using target file: $TARGET_FILE"
+    echo "[INFO] Targets: $(wc -l < $TARGET_FILE) line(s)"
 }
 
 # ============================================================================
@@ -305,7 +310,7 @@ MONITOR_EOF
     chmod +x "${WORK_DIR}/keyhunt_monitor.sh"
 
     # GPU BSGS 명령어 (핵심 수정!)
-    local cmd="./build/keyhunt -m bsgs -f ${WORK_DIR}/puzzle71_target.txt $range_flag --gpu -g $GPU_DEVICE --gpu-threads $GPU_THREADS --gpu-blocks $GPU_BLOCKS -t $CPU_THREADS -s $STATS_INTERVAL"
+    local cmd="./build/keyhunt -m bsgs -f $TARGET_FILE $range_flag --gpu -g $GPU_DEVICE --gpu-threads $GPU_THREADS --gpu-blocks $GPU_BLOCKS -t $CPU_THREADS -s $STATS_INTERVAL"
     
     echo "[CMD] $cmd"
     
