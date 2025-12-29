@@ -5764,6 +5764,11 @@ void menu() {
 	printf("-t tn       Threads number, must be a positive integer\n");
 	printf("-v value    Search for vanity Address, only with -m vanity\n");
 	printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
+	printf("\nCUDA Options:\n");
+	printf("  --gpu            Enable GPU acceleration\n");
+	printf("  -g <device>      GPU device ID\n");
+	printf("  --gpu-threads    Threads per block\n");
+	printf("  --gpu-blocks     Number of blocks\n");
 	printf("\nExample:\n\n");
 	printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
 	printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");

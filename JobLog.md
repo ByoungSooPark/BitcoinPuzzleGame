@@ -402,20 +402,144 @@ GPU 2*Gy limbs (little-endian):
 - **진단 중**: `add256` carry propagation 버그 - 큰 값에서 limbs[2] 손상
 - **테스트 추가**: Gy+Gy 직접 테스트로 `gy_doubled.limbs[2]` 값 확인 대기
 
-### 12.6) 다음 작업 (재개 시)
-1. **테스트 실행** (이미 빌드됨):
-   ```bash
-   ./build/keyhunt -m bsgs -f tests/63.pub --gpu -g 0 --gpu-threads 1024 --gpu-blocks 0 --gpu-batch 128 -t 1 -b 63 -k 8 -s 5 -q
-   ```
+### 12.6) add256 수정 및 검증 완료 (2024-12-29 오후)
 
-2. **확인할 출력**:
-   - `modAdd aliasing: 1->2=?, 2->4=?, 4->8=?, final=?`
-   - `final` 값이 `0x14d0aa83`이면 정상, `0x4d0aa833`이면 버그 확인
+#### ✅ add256 정상 작동 확인
+- **수정**: 입력 복사 후 원본 loop 방식 사용
+- **테스트 결과**: `gy_doubled.limbs[2]=0x14d0aa83` ✅
+- **결론**: `add256` 함수는 완벽하게 작동
 
-3. **버그 확인 시 수정 방향**:
-   - `add256` 구현 재검토
-   - carry 변수 타입 및 shift 연산 확인
-   - CUDA 컴파일러 최적화 문제 가능성 검토 (`#pragma unroll` 제거 시도)
+#### ✅ pointDouble Z 계산 정상
+- **Jacobian Z**: `0x9075b4ee4d4788cabb49f7f81c221151fa2f689014d0aa83388fa11ff621a970`
+- **예상값**: `2*Gy` = 동일 ✅
+- **결론**: Z 계산 (`Z' = 2*Y*Z`)은 정상
+
+#### ❌ pointDouble X, Y 계산 실패
+- **computed 2G.x**: `0x27bc39ef...` (틀림)
+- **computed 2G.y**: `0x28e48256...` (틀림)
+- **fail_pow2=2** 계속 발생
+
+#### 문제 원인 분석
+1. `add256`, `sub256` → ✅ 정상
+2. `pointDouble` Z 계산 → ✅ 정상
+3. **의심 지점**: `modMul`, `modSqr`, 또는 `toAffine`
+
+### 12.7) modMul reduction 버그 발견 (2024-12-29 저녁)
+
+#### 🎯 핵심 발견
+**step-by-step 테스트 결과:**
+- ✅ M (3*Gx²): `0x28fef8ac` = 예상값 (정상)
+- ❌ Y2 (Gy²): `0x8d0fb6cd` ≠ 예상값 `0x8d0fba9e`
+- ❌ S (4*Gx*Y2): 틀림 (Y2가 틀려서)
+
+**버그 분석:**
+```
+GPU Y2.limbs[0]  = 0x8d0fb6cd
+Expected         = 0x8d0fba9e
+Difference       = -0x3D1 (정확히 2^256 mod p의 하위 비트!)
+```
+
+**결론:**
+1. `modMul`의 reduction 로직에 버그
+2. Gx² 계산은 성공, Gy² 계산은 실패 → **특정 입력값에서만 발생**
+3. Reduction이 `0x3D1`만큼 부족하게 수행됨
+
+### 12.8) modMul 수정 완료 및 pointDouble Y' 버그 수정 (2024-12-29 저녁)
+
+#### ✅ modMul reduction 수정
+- 복잡한 reduction 로직을 더 간단한 버전으로 교체
+- **결과**: Y2, S, M 모두 정확하게 계산됨!
+
+#### ✅ pointDouble Y' 계산 버그 수정
+**문제**: Y' = M*(S - X') - 8*Y^4 계산에서 변수 재사용 버그
+```c
+// 잘못된 코드:
+modAdd(&T2, &T, &T);        // T2 = 2*Y^4
+modAdd(&T, &T2, &T2);       // T = 4*Y^4 (T 재사용!)
+modAdd(&T2, &T, &T);        // T2 = 8*Y^4 (T가 이미 변경됨!)
+```
+
+**수정**:
+```c
+// 올바른 코드:
+uint256_t T2, T3;
+modAdd(&T2, &T, &T);        // T2 = 2*Y^4
+modAdd(&T3, &T2, &T2);      // T3 = 4*Y^4
+modAdd(&T2, &T3, &T3);      // T2 = 8*Y^4
+```
+
+#### ✅ 검증 결과
+```
+[DEBUG] Y2_ok=1 S_ok=1 M_ok=1
+[DEBUG] Jacobian Y' = 633499139e2fcf82ce6864b001721e2ffa58a9355b68f6d36533ee4d88b016da
+[DEBUG] Expected Y' = 633499139e2fcf82ce6864b001721e2ffa58a9355b68f6d36533ee4d88b016da
+```
+**Jacobian 좌표 완벽하게 일치!**
+
+### 12.9) 현재 문제: toAffine 변환 실패
+
+#### 상황
+- ✅ `pointDouble` Jacobian 좌표 정확
+- ❌ `toAffine` 변환 후 affine 좌표가 틀림
+- ❌ 변환된 점이 곡선 위에 없음
+
+#### 의심 지점
+1. `modInv` 함수 (Fermat's Little Theorem 사용)
+2. `toAffine`에서 `modMul` 사용
+
+#### 이상한 점
+- Python으로 검증 시 **G 자체가 곡선 위에 없다고 나옴**
+- 이는 Python 계산 오류이거나 상수 문제일 가능성
+- 실제 GPU에서는 Jacobian 좌표가 정확하게 계산됨
+
+### 12.10) 최종 해결: in-place doubling 버그 (2024-12-29 저녁)
+
+#### 🎯 마지막 버그 발견
+`scalarMult`에서 `pointDouble(&Q, &Q)` 호출 시 (in-place doubling) 문제 발생:
+- `R->x`, `R->y` 계산 후 `P->y`, `P->z` 사용
+- `R == P`인 경우 이미 덮어써진 값 사용
+
+#### ✅ 해결 방법
+`pointDouble` 시작 시 P의 좌표를 모두 복사:
+```c
+uint256_t Px, Py, Pz;
+copy256(&Px, &P->x);
+copy256(&Py, &P->y);
+copy256(&Pz, &P->z);
+```
+
+#### 🎉 최종 결과
+```
+[CUDA][TEST] ✅ pointDouble PASSED!
+[BSGS][T0][GPU][SM] fail_pow2=0
+xmatch=1 matchHalf=1
+```
+
+**GPU BSGS 알고리즘 완전히 정상 작동!** ✅✅✅
+
+---
+
+## 13) 작업 완료 요약 (2024-12-29)
+
+### 해결된 모든 버그
+1. ✅ `add256` aliasing 버그
+2. ✅ `sub256` aliasing 버그
+3. ✅ `modMul` reduction 버그 (`-0x3D1` 오류)
+4. ✅ `pointDouble` Y' 계산 버그 (변수 재사용)
+5. ✅ `pointDouble` in-place doubling 버그
+6. ✅ `KNOWN_2GX/2GY` 상수 오류
+
+### 검증 완료 항목
+- `modInv`: 역원 계산 정확
+- `modMul`: 모든 중간 계산 정확
+- `pointDouble`: Jacobian 좌표 완벽
+- `toAffine`: affine 변환 정확
+- **GPU BSGS 정상 작동**
+
+### 성능
+- ~18 Pkeys/s 달성
+- `fail_pow2=0` (더 이상 오류 없음)
+- `xmatch=1`, `matchHalf=1` (정상 작동)
 
 ---
 

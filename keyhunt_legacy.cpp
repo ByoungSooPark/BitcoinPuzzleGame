@@ -2016,22 +2016,13 @@ int main(int argc, char **argv) 	{
 					uint32_t pd_2gx[8], pd_2gy[8];
 					uint32_t jac_y[8], jac_z[8];
 					if(keyhunt_cudaTestPointDouble(&pd_x_match, &pd_y_match, pd_2gx, pd_2gy, &add_t1, &add_t2, &add_t3, &add_res, jac_y, jac_z) == 0) {
-						printf("[CUDA][TEST] modAdd aliasing: 1->2=%d, 2->4=%d, 4->8=%d, final=%u (0x%08x)\n", add_t1, add_t2, add_t3, add_res, add_res);
+						printf("[CUDA][TEST] modInv(2): 2*inv(2)=1 test1=%d test2=%d result=0x%08x\n", add_t1, add_t2, add_res);
+						printf("[CUDA][TEST] modInv(Z): Z*inv(Z)=1 test=%d\n", add_t3);
 						printf("[CUDA][TEST] pointDouble(G)->2G: x_match=%d y_match=%d\n", pd_x_match, pd_y_match);
 						if(pd_x_match != 1 || pd_y_match != 1) {
-							printf("[CUDA][TEST] computed 2G.x = ");
-							for(int i=7; i>=0; i--) printf("%08x", pd_2gx[i]);
-							printf("\n[CUDA][TEST] expected 2G.x = c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\n");
-							printf("[CUDA][TEST] computed 2G.y = ");
-							for(int i=7; i>=0; i--) printf("%08x", pd_2gy[i]);
-							printf("\n[CUDA][TEST] expected 2G.y = 1ae168fea63dc339a3c58419466ceae1061b7cd5f69e89e29fb77f17538bddba\n");
-							printf("[CUDA][TEST] Jacobian Y = ");
-							for(int i=7; i>=0; i--) printf("%08x", jac_y[i]);
-							printf("\n[CUDA][TEST] Jacobian Z = ");
-							for(int i=7; i>=0; i--) printf("%08x", jac_z[i]);
-							printf("\n");
+							printf("[CUDA][TEST] ❌ pointDouble FAILED\n");
 						} else {
-							printf("[CUDA][TEST] ✅ pointDouble test PASSED!\n");
+							printf("[CUDA][TEST] ✅ pointDouble PASSED!\n");
 						}
 					} else {
 						printf("[CUDA][TEST] pointDouble test FAILED to run\n");

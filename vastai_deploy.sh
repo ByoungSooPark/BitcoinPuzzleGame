@@ -20,7 +20,7 @@ set -e
 # ============================================================================
 
 # Discord webhook URL - REQUIRED! Get from Discord Server Settings > Integrations > Webhooks
-DISCORD_WEBHOOK="https://discordapp.com/api/webhooks/1443124373639925770/HG9BSVbH02AAUo7JDNzCxcXKLN62zCTJ4fejBpkL6Fd_1EGdXQjloHmBsKFhKA0AwL5F"
+DISCORD_WEBHOOK="https://discord.com/api/webhooks/1357451751908839576/qDswrcM9eK9zE02SWFQqIOA7068OTZWgdbsJ7_7END4cLgH57En7mj5TTIuQToBaJWCJ"
 
 # Target for Puzzle #71 - NO public key available, must search by ADDRESS
 # Using -m address mode (slower than BSGS but works without public key)
@@ -30,16 +30,16 @@ TARGET_ADDRESS="1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
 BIT_RANGE=71
 
 # Number of CPU threads (vast.ai 16x5090 machine has 96-core EPYC)
-CPU_THREADS=96
+CPU_THREADS=20
 
 # Stats interval in seconds
 STATS_INTERVAL=60
 
 # File locations
-LOG_FILE="/root/keyhunt_puzzle71.log"
-RESULT_FILE="/root/keyhunt_FOUND.txt"
-CHECKPOINT_FILE="/root/keyhunt_checkpoint.txt"
-RANGES_SEARCHED_FILE="/root/keyhunt_ranges_searched.txt"
+LOG_FILE="/home/park/keyhunt_puzzle71.log"
+RESULT_FILE="/home/park/keyhunt_FOUND.txt"
+CHECKPOINT_FILE="/home/park/keyhunt_checkpoint.txt"
+RANGES_SEARCHED_FILE="/home/park/keyhunt_ranges_searched.txt"
 
 # GitHub repo (private - you'll need to authenticate)
 REPO_URL="https://github.com/consigcody94/keyhuntM1CPU.git"
@@ -127,16 +127,16 @@ cleanup() {
     save_checkpoint
 
     # Kill keyhunt gracefully
-    if [ -f /root/keyhunt.pid ]; then
-        local pid=$(cat /root/keyhunt.pid)
+    if [ -f /home/park/keyhunt.pid ]; then
+        local pid=$(cat /home/park/keyhunt.pid)
         kill -TERM $pid 2>/dev/null || true
         sleep 2
         kill -9 $pid 2>/dev/null || true
     fi
 
     # Kill monitor
-    if [ -f /root/monitor.pid ]; then
-        kill $(cat /root/monitor.pid) 2>/dev/null || true
+    if [ -f /home/park/monitor.pid ]; then
+        kill $(cat /home/park/monitor.pid) 2>/dev/null || true
     fi
 
     # Send Discord notification
@@ -248,8 +248,8 @@ build_keyhunt() {
 # ============================================================================
 
 create_target_file() {
-    echo "$TARGET_ADDRESS" > /root/puzzle71_target.txt
-    echo "[INFO] Target file created with ADDRESS: /root/puzzle71_target.txt"
+    echo "$TARGET_ADDRESS" > /home/park/puzzle71_target.txt
+    echo "[INFO] Target file created with ADDRESS: /home/park/puzzle71_target.txt"
 }
 
 # ============================================================================
@@ -261,7 +261,7 @@ run_keyhunt() {
     echo "Starting Keyhunt Puzzle #71 Hunt"
     echo "============================================"
 
-    cd /root/keyhuntM1CPU
+    cd /home/park/keyhuntM1CPU
 
     # Initialize ranges file if not exists
     touch "$RANGES_SEARCHED_FILE"
@@ -281,15 +281,15 @@ run_keyhunt() {
     fi
 
     # Create the monitoring script with checkpoint saving
-    cat > /root/keyhunt_monitor.sh << 'MONITOR_EOF'
+    cat > /home/park/keyhunt_monitor.sh << 'MONITOR_EOF'
 #!/bin/bash
 
 LOG_FILE="$1"
 RESULT_FILE="$2"
 DISCORD_WEBHOOK="$3"
 TARGET_ADDRESS="$4"
-CHECKPOINT_FILE="/root/keyhunt_checkpoint.txt"
-RANGES_SEARCHED_FILE="/root/keyhunt_ranges_searched.txt"
+CHECKPOINT_FILE="/home/park/keyhunt_checkpoint.txt"
+RANGES_SEARCHED_FILE="/home/park/keyhunt_ranges_searched.txt"
 
 send_found_notification() {
     local private_key="$1"
@@ -401,7 +401,7 @@ while true; do
 done
 MONITOR_EOF
 
-    chmod +x /root/keyhunt_monitor.sh
+    chmod +x /home/park/keyhunt_monitor.sh
 
     # Set up signal handlers for graceful shutdown
     trap cleanup SIGTERM SIGINT SIGHUP
@@ -414,20 +414,20 @@ MONITOR_EOF
     # -l compress: look for compressed addresses
     # -R: random mode for better coverage
     # -c btc: bitcoin
-    local cmd="./build/keyhunt -m address -f /root/puzzle71_target.txt -b $BIT_RANGE -l compress -c btc -R -t $CPU_THREADS -s $STATS_INTERVAL"
+    local cmd="./build/keyhunt -m address -f /home/park/puzzle71_target.txt -b $BIT_RANGE -l compress -c btc -R -t $CPU_THREADS -s $STATS_INTERVAL"
     echo "Command: $cmd"
 
     nohup $cmd >> "$LOG_FILE" 2>&1 &
 
     KEYHUNT_PID=$!
     echo "[INFO] Keyhunt started with PID: $KEYHUNT_PID"
-    echo "$KEYHUNT_PID" > /root/keyhunt.pid
+    echo "$KEYHUNT_PID" > /home/park/keyhunt.pid
 
     # Start monitor in background
-    nohup /root/keyhunt_monitor.sh "$LOG_FILE" "$RESULT_FILE" "$DISCORD_WEBHOOK" "$TARGET_ADDRESS" >> /root/monitor.log 2>&1 &
+    nohup /home/park/keyhunt_monitor.sh "$LOG_FILE" "$RESULT_FILE" "$DISCORD_WEBHOOK" "$TARGET_ADDRESS" >> /home/park/monitor.log 2>&1 &
     MONITOR_PID=$!
     echo "[INFO] Monitor started with PID: $MONITOR_PID"
-    echo "$MONITOR_PID" > /root/monitor.pid
+    echo "$MONITOR_PID" > /home/park/monitor.pid
 
     echo ""
     echo "============================================"
@@ -465,8 +465,8 @@ status() {
     echo "Keyhunt Status"
     echo "============================================"
 
-    if [ -f /root/keyhunt.pid ]; then
-        local pid=$(cat /root/keyhunt.pid)
+    if [ -f /home/park/keyhunt.pid ]; then
+        local pid=$(cat /home/park/keyhunt.pid)
         if ps -p $pid > /dev/null 2>&1; then
             echo "[✓] Keyhunt is RUNNING (PID: $pid)"
         else
@@ -514,8 +514,8 @@ stop() {
     # Save checkpoint first
     save_checkpoint
 
-    if [ -f /root/keyhunt.pid ]; then
-        local pid=$(cat /root/keyhunt.pid)
+    if [ -f /home/park/keyhunt.pid ]; then
+        local pid=$(cat /home/park/keyhunt.pid)
         echo "Sending SIGTERM to PID $pid..."
         kill -TERM $pid 2>/dev/null || true
         sleep 2
@@ -525,12 +525,12 @@ stop() {
             echo "Force killing..."
             kill -9 $pid 2>/dev/null || true
         fi
-        rm /root/keyhunt.pid
+        rm /home/park/keyhunt.pid
     fi
 
-    if [ -f /root/monitor.pid ]; then
-        kill $(cat /root/monitor.pid) 2>/dev/null || true
-        rm /root/monitor.pid
+    if [ -f /home/park/monitor.pid ]; then
+        kill $(cat /home/park/monitor.pid) 2>/dev/null || true
+        rm /home/park/monitor.pid
     fi
 
     pkill -f "keyhunt.*bsgs" 2>/dev/null || true
@@ -553,7 +553,7 @@ stop() {
 # ============================================================================
 
 download_progress() {
-    local backup_file="/root/keyhunt_progress_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    local backup_file="/home/park/keyhunt_progress_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
 
     echo "Creating progress backup..."
     tar -czf "$backup_file" \
@@ -615,7 +615,7 @@ case "${1:-run}" in
             fi
         fi
 
-        if [ ! -f "/root/keyhuntM1CPU/build/keyhunt" ]; then
+        if [ ! -f "/home/park/keyhuntM1CPU/build/keyhunt" ]; then
             echo "[INFO] Keyhunt not built yet, running full setup..."
             setup_environment
             build_keyhunt
