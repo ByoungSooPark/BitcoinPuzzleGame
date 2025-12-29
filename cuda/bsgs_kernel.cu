@@ -10,6 +10,9 @@
 
 #include "secp256k1.cuh"
 #include <stdio.h>
+#include <stdint.h>
+ #include <atomic>
+ #include <chrono>
 
 // ============================================================================
 // Configuration
@@ -28,6 +31,813 @@ struct BabyStepEntry {
     uint32_t hash;      // 32-bit hash of X coordinate
     uint32_t index;     // Index in baby step table
 };
+
+// ============================================================================
+// Device-resident legacy bloom filters (256-way bucketed)
+// Forward declarations (used by kernels declared before definitions)
+// ============================================================================
+
+extern __device__ __managed__ uint8_t* g_bloomFlat;
+extern __device__ __managed__ uint64_t g_bloomBytesPer;
+extern __device__ __managed__ uint64_t g_bloomBits;
+extern __device__ __managed__ uint8_t g_bloomHashes;
+
+__global__ void legacyGiantGroupBloomBatchKernel(
+    const uint32_t* startXBatch, const uint32_t* startYBatch,
+    const uint32_t* stepX, const uint32_t* stepY,
+    int groupSize,
+    int batchCount,
+    uint8_t* outHits
+);
+
+static __device__ __forceinline__ void u256_to_raw32_be(const uint256_t* x, uint8_t out[32]);
+
+ static std::atomic<uint64_t> g_legacyGroupCheckCalls{0};
+ static std::atomic<uint64_t> g_legacyGroupCheckPoints{0};
+ static std::atomic<uint64_t> g_legacyGroupCheckNanos{0};
+
+ extern "C" void keyhunt_cudaGetLegacyGroupCheckStats(uint64_t* calls, uint64_t* points, uint64_t* nanos) {
+     if (calls) *calls = g_legacyGroupCheckCalls.load(std::memory_order_relaxed);
+     if (points) *points = g_legacyGroupCheckPoints.load(std::memory_order_relaxed);
+     if (nanos) *nanos = g_legacyGroupCheckNanos.load(std::memory_order_relaxed);
+ }
+
+__global__ void legacyDebugFirstXKernel(
+    const uint32_t* startX, const uint32_t* startY,
+    const uint32_t* stepX, const uint32_t* stepY,
+    int groupSize,
+    uint8_t* outX32
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (groupSize <= 0) return;
+
+    Point start;
+    Point step;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        start.x.limbs[i] = startX[i];
+        start.y.limbs[i] = startY[i];
+        step.x.limbs[i] = stepX[i];
+        step.y.limbs[i] = stepY[i];
+    }
+    start.z.limbs[0] = 1;
+    step.z.limbs[0] = 1;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        start.z.limbs[i] = 0;
+        step.z.limbs[i] = 0;
+    }
+
+    // tid=0 in legacy kernel => offset = -half
+    int half = groupSize / 2;
+    int offset = -half;
+
+    Point cur;
+    copy256(&cur.x, &start.x);
+    copy256(&cur.y, &start.y);
+    copy256(&cur.z, &start.z);
+
+    if (offset != 0) {
+        uint256_t k;
+        uint32_t a = (uint32_t)(-offset);
+        k.limbs[0] = a;
+        #pragma unroll
+        for (int i = 1; i < 8; i++) k.limbs[i] = 0;
+
+        Point stepUse;
+        copy256(&stepUse.x, &step.x);
+        copy256(&stepUse.y, &step.y);
+        copy256(&stepUse.z, &step.z);
+
+        // offset < 0 => negate Y
+        uint256_t p;
+        set256FromConst(&p, SECP256K1_P);
+        modSub(&stepUse.y, &p, &stepUse.y);
+
+        Point mul;
+        scalarMult(&mul, &k, &stepUse);
+        pointAdd(&cur, &cur, &mul);
+    }
+
+    Point affine;
+    copy256(&affine.x, &cur.x);
+    copy256(&affine.y, &cur.y);
+    copy256(&affine.z, &cur.z);
+    toAffine(&affine);
+
+    uint8_t raw[32];
+    u256_to_raw32_be(&affine.x, raw);
+    for (int i = 0; i < 32; i++) {
+        outX32[i] = raw[i];
+    }
+}
+
+__global__ void legacyDebugScalarMultXKernel(
+    const uint32_t* stepX, const uint32_t* stepY,
+    uint32_t k_scalar,
+    uint8_t* outX32
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    Point step;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        step.x.limbs[i] = stepX[i];
+        step.y.limbs[i] = stepY[i];
+        step.z.limbs[i] = 0;
+    }
+    step.z.limbs[0] = 1;
+
+    uint256_t k;
+    k.limbs[0] = k_scalar;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) k.limbs[i] = 0;
+
+    Point mul;
+    scalarMult(&mul, &k, &step);
+    toAffine(&mul);
+
+    uint8_t raw[32];
+    u256_to_raw32_be(&mul.x, raw);
+    for (int i = 0; i < 32; i++) {
+        outX32[i] = raw[i];
+    }
+}
+
+// Known 2G values for secp256k1 (big-endian bytes)
+// 2G.x = 0xC6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5
+// 2G.y = 0x1AE168FEA63DC339A3C58419466CEAE1061B7CD5F69E89E29FB77F17538BDDBA
+__constant__ uint32_t KNOWN_2GX[8] = {
+    0x5C709EE5, 0xABAC09B9, 0x8CEF3CA7, 0x5C778E4B,
+    0x95C07CD8, 0x3045406E, 0x41ED7D6D, 0xC6047F94
+};
+__constant__ uint32_t KNOWN_2GY[8] = {
+    0x538BDDBA, 0x9FB77F17, 0xF69E89E2, 0x061B7CD5,
+    0x466CEAE1, 0xA3C58419, 0xA63DC339, 0x1AE168FE
+};
+
+// Test kernel: compute 2G using pointDouble(G) and compare to known value
+// Also test basic modAdd(&x, &x, &x) to verify aliasing fix
+__global__ void testPointDoubleKernel(uint32_t* outResult) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    // Simple modMul test first: 2 * 3 = 6
+    uint256_t two, three, six_result;
+    for (int i = 0; i < 8; i++) {
+        two.limbs[i] = 0;
+        three.limbs[i] = 0;
+    }
+    two.limbs[0] = 2;
+    three.limbs[0] = 3;
+    modMul(&six_result, &two, &three);
+    int simple_mul_ok = (six_result.limbs[0] == 6 && six_result.limbs[1] == 0) ? 1 : 0;
+    
+    // Test 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001 (no reduction needed)
+    uint256_t big_a, big_result;
+    for (int i = 0; i < 8; i++) big_a.limbs[i] = 0;
+    big_a.limbs[0] = 0xFFFFFFFF;
+    modMul(&big_result, &big_a, &big_a);
+    // 0xFFFFFFFF^2 = 0xFFFFFFFE00000001
+    int big_mul_ok = (big_result.limbs[0] == 0x00000001 && big_result.limbs[1] == 0xFFFFFFFE) ? 1 : 0;
+    
+    // Test reduction: 2^128 * 2^128 = 2^256 ≡ 0x1000003D1 (mod p)
+    uint256_t pow128;
+    for (int i = 0; i < 8; i++) pow128.limbs[i] = 0;
+    pow128.limbs[4] = 1;  // 2^128 = limbs[4] = 1
+    uint256_t reduce_result;
+    modMul(&reduce_result, &pow128, &pow128);
+    // 2^256 mod p = 0x1000003D1
+    int reduce_ok = (reduce_result.limbs[0] == 0x000003D1 && reduce_result.limbs[1] == 0x00000001 && 
+                     reduce_result.limbs[2] == 0 && reduce_result.limbs[7] == 0) ? 1 : 0;
+
+    // First: test Gy + Gy directly - manual implementation to verify
+    uint256_t gy_copy, gy_doubled;
+    set256FromConst(&gy_copy, SECP256K1_GY);
+    
+    // Manual add without using add256 to verify expected result
+    uint64_t carry = 0;
+    for (int i = 0; i < 8; i++) {
+        carry += (uint64_t)gy_copy.limbs[i] + (uint64_t)gy_copy.limbs[i];
+        gy_doubled.limbs[i] = (uint32_t)carry;
+        carry >>= 32;
+    }
+    
+    // Check if gy_doubled.limbs[2] is correct
+    // Gy.limbs[2] = 0x0A685541, 2*0x0A685541 + carry(1) = 0x14D0AA83
+    int add_test1 = (gy_doubled.limbs[0] == 0xf621a970) ? 1 : 0;
+    int add_test2 = (gy_doubled.limbs[1] == 0x388fa11f) ? 1 : 0;
+    int add_test3 = (gy_doubled.limbs[2] == 0x14d0aa83) ? 1 : 0;
+
+    // Test modSqr(Gy) - expected result from Python:
+    // Gy^2 mod p = 0x8dad9b1c47e776deae6860f9a07240aa44ce50498c351de69368de5e8d0fba9e
+    uint256_t gy_squared;
+    
+    // First verify Gy is loaded correctly
+    // Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B4480A6855419C47D08FFB10D4B8
+    // limbs[0] = 0xFB10D4B8
+    int gy_load_ok = (gy_copy.limbs[0] == 0xFB10D4B8) ? 1 : 0;
+    
+    // Use modMul directly instead of modSqr to rule out aliasing
+    uint256_t gy_copy2;
+    set256FromConst(&gy_copy2, SECP256K1_GY);
+    modMul(&gy_squared, &gy_copy, &gy_copy2);
+    
+    // Check limbs[0] = 0x8d0fba9e
+    int modsqr_ok = (gy_squared.limbs[0] == 0x8d0fba9e) ? 1 : 0;
+
+    // Test pointDouble step by step with G
+    Point G;
+    set256FromConst(&G.x, SECP256K1_GX);
+    set256FromConst(&G.y, SECP256K1_GY);
+    G.z.limbs[0] = 1;
+    for (int i = 1; i < 8; i++) G.z.limbs[i] = 0;
+    
+    // Manual pointDouble calculation to debug
+    uint256_t Y2_test, S_test, M_test;
+    
+    // Step 1: Y2 = Gy^2
+    modSqr(&Y2_test, &G.y);
+    // Expected: 0x8dad9b1c47e776deae6860f9a07240aa44ce50498c351de69368de5e8d0fba9e
+    int y2_ok = (Y2_test.limbs[0] == 0x8d0fba9e) ? 1 : 0;
+    
+    // Step 2: S = 4*Gx*Y2
+    modMul(&S_test, &G.x, &Y2_test);
+    uint256_t S_temp;
+    modAdd(&S_temp, &S_test, &S_test);
+    modAdd(&S_test, &S_temp, &S_temp);
+    // Expected S: 0x17ee882cab862478855fd28eccca911c2e6f3b65a8345994f58b9638770afacf
+    int s_ok = (S_test.limbs[0] == 0x770afacf) ? 1 : 0;
+    
+    // Step 3: M = 3*Gx^2
+    modSqr(&M_test, &G.x);
+    uint256_t M_temp;
+    modAdd(&M_temp, &M_test, &M_test);
+    modAdd(&M_test, &M_temp, &M_test);
+    // Expected M: 0x8ff2b776aaf6d91942fd096d2f1f7fd9aa2f64be71462131aa7f067e28fef8ac
+    int m_ok = (M_test.limbs[0] == 0x28fef8ac) ? 1 : 0;
+
+    // Compute 2G using pointDouble
+    Point twoG;
+    pointDouble(&twoG, &G);
+    
+    // Save Jacobian Y and Z before toAffine
+    uint256_t jacobian_y, jacobian_z;
+    copy256(&jacobian_y, &twoG.y);
+    copy256(&jacobian_z, &twoG.z);
+    
+    toAffine(&twoG);
+
+    // Compare X coordinate
+    uint256_t expected_x;
+    set256FromConst(&expected_x, KNOWN_2GX);
+    int x_match = (cmp256(&twoG.x, &expected_x) == 0) ? 1 : 0;
+
+    // Compare Y coordinate
+    uint256_t expected_y;
+    set256FromConst(&expected_y, KNOWN_2GY);
+    int y_match = (cmp256(&twoG.y, &expected_y) == 0) ? 1 : 0;
+
+    // Output: [0]=x_match, [1]=y_match, [2..9]=computed 2G.x, [10..17]=computed 2G.y
+    // [18]=add_test1, [19]=add_test2, [20]=add_test3, [21]=testVal.limbs[0]
+    // [22..29]=jacobian_y, [30..37]=jacobian_z
+    outResult[0] = x_match;
+    outResult[1] = y_match;
+    for (int i = 0; i < 8; i++) {
+        outResult[2 + i] = twoG.x.limbs[i];
+        outResult[10 + i] = twoG.y.limbs[i];
+    }
+    outResult[18] = add_test1;
+    outResult[19] = add_test2;
+    outResult[20] = add_test3;
+    outResult[21] = gy_doubled.limbs[2];  // gy_doubled.limbs[2] for debugging
+    for (int i = 0; i < 8; i++) {
+        outResult[22 + i] = jacobian_y.limbs[i];
+        outResult[30 + i] = jacobian_z.limbs[i];
+    }
+    // New step-by-step tests
+    outResult[38] = y2_ok;  // Y2 = Gy^2 test
+    outResult[39] = s_ok;   // S = 4*Gx*Y2 test
+    outResult[40] = m_ok;   // M = 3*Gx^2 test
+    outResult[41] = Y2_test.limbs[0];  // actual Y2.limbs[0]
+    outResult[42] = S_test.limbs[0];   // actual S.limbs[0]
+    outResult[43] = M_test.limbs[0];   // actual M.limbs[0]
+}
+
+extern "C" int keyhunt_cudaTestPointDouble(
+    int* x_match, int* y_match,
+    uint32_t computed_2gx[8], uint32_t computed_2gy[8],
+    int* add_test1, int* add_test2, int* add_test3, uint32_t* add_result,
+    uint32_t jacobian_y[8], uint32_t jacobian_z[8]
+) {
+    static uint32_t* d_result = nullptr;
+    if (!d_result) {
+        cudaError_t err = cudaMalloc((void**)&d_result, 50 * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+    }
+
+    testPointDoubleKernel<<<1, 1>>>(d_result);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return -1;
+
+    uint32_t h_result[50];
+    err = cudaMemcpy(h_result, d_result, 50 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return -1;
+
+    *x_match = h_result[0];
+    *y_match = h_result[1];
+    for (int i = 0; i < 8; i++) {
+        computed_2gx[i] = h_result[2 + i];
+        computed_2gy[i] = h_result[10 + i];
+    }
+    *add_test1 = h_result[18];
+    *add_test2 = h_result[19];
+    *add_test3 = h_result[20];
+    *add_result = h_result[21];
+    for (int i = 0; i < 8; i++) {
+        jacobian_y[i] = h_result[22 + i];
+        jacobian_z[i] = h_result[30 + i];
+    }
+    
+    // Print simple modMul test results
+    printf("[CUDA][TEST] modMul 2*3: ok=%d result=%u (expected 6)\n", h_result[39], h_result[41]);
+    printf("[CUDA][TEST] modMul 0xFFFFFFFF^2: ok=%d limbs[0]=%08x limbs[1]=%08x (expected 00000001 fffffffe)\n", 
+           h_result[40], h_result[42], h_result[43]);
+    printf("[CUDA][TEST] modMul 2^128*2^128 (reduction): ok=%d limbs[0]=%08x limbs[1]=%08x (expected 000003d1 00000001)\n",
+           h_result[44], h_result[45], h_result[46]);
+    printf("[CUDA][TEST] Gy load: ok=%d limbs[0]=%08x (expected fb10d4b8)\n", h_result[47], h_result[48]);
+    
+    return 0;
+}
+
+extern "C" int keyhunt_cudaLegacyDebugFirstX(
+    const uint32_t startX[8], const uint32_t startY[8],
+    const uint32_t stepX[8], const uint32_t stepY[8],
+    int groupSize,
+    uint8_t outX32[32]
+) {
+    if (!startX || !startY || !stepX || !stepY || !outX32) return -1;
+    if (groupSize <= 0) return -1;
+
+    static thread_local uint32_t* d_startX = nullptr;
+    static thread_local uint32_t* d_startY = nullptr;
+    static thread_local uint32_t* d_stepX  = nullptr;
+    static thread_local uint32_t* d_stepY  = nullptr;
+    static thread_local uint8_t*  d_outX32 = nullptr;
+
+    cudaError_t err = cudaSuccess;
+    if (!d_startX) {
+        err = cudaMalloc((void**)&d_startX, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_startY, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_stepX, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_stepY, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_outX32, 32u);
+        if (err != cudaSuccess) return -1;
+    }
+
+    err = cudaMemcpy(d_startX, startX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_startY, startY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_stepX, stepX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_stepY, stepY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    legacyDebugFirstXKernel<<<1, 1>>>(d_startX, d_startY, d_stepX, d_stepY, groupSize, d_outX32);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(outX32, d_outX32, 32u, cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int keyhunt_cudaLegacyGroupCheckBatch(
+    const uint32_t* startXBatch, const uint32_t* startYBatch,
+    int batchCount,
+    const uint32_t stepX[8], const uint32_t stepY[8],
+    int groupSize,
+    void* d_hits,
+    uint8_t* outHits,
+    int threadsPerBlock,
+    int numBlocks
+) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (startXBatch == NULL || startYBatch == NULL || stepX == NULL || stepY == NULL || d_hits == NULL || outHits == NULL) {
+        return -1;
+    }
+    if (batchCount <= 0 || groupSize <= 0) {
+        return -1;
+    }
+
+    g_legacyGroupCheckCalls.fetch_add(1u, std::memory_order_relaxed);
+    g_legacyGroupCheckPoints.fetch_add((uint64_t)groupSize * (uint64_t)batchCount, std::memory_order_relaxed);
+
+    static thread_local uint32_t* d_startXBatch = nullptr;
+    static thread_local uint32_t* d_startYBatch = nullptr;
+    static thread_local int d_batchCapacity = 0;
+
+    static thread_local uint32_t* d_stepX  = nullptr;
+    static thread_local uint32_t* d_stepY  = nullptr;
+
+    cudaError_t err = cudaSuccess;
+
+    if (d_stepX == nullptr) {
+        err = cudaMalloc((void**)&d_stepX, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_stepY, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+    }
+
+    if (d_startXBatch == nullptr || d_startYBatch == nullptr || d_batchCapacity < batchCount) {
+        if (d_startXBatch) cudaFree(d_startXBatch);
+        if (d_startYBatch) cudaFree(d_startYBatch);
+        d_startXBatch = nullptr;
+        d_startYBatch = nullptr;
+        d_batchCapacity = 0;
+
+        size_t bytes = (size_t)batchCount * 8u * sizeof(uint32_t);
+        err = cudaMalloc((void**)&d_startXBatch, bytes);
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_startYBatch, bytes);
+        if (err != cudaSuccess) return -1;
+        d_batchCapacity = batchCount;
+    }
+
+    err = cudaMemcpy(d_stepX, stepX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_stepY, stepY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    size_t batchBytes = (size_t)batchCount * 8u * sizeof(uint32_t);
+    err = cudaMemcpy(d_startXBatch, startXBatch, batchBytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_startYBatch, startYBatch, batchBytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    if (threadsPerBlock <= 0) threadsPerBlock = 256;
+    if (threadsPerBlock > 1024) threadsPerBlock = 1024;
+
+    int total = groupSize * batchCount;
+    const int requiredBlocks = (total + threadsPerBlock - 1) / threadsPerBlock;
+    int blocks = numBlocks;
+    if (blocks <= 0) {
+        blocks = requiredBlocks;
+    } else if (blocks > requiredBlocks) {
+        blocks = requiredBlocks;
+    }
+
+    legacyGiantGroupBloomBatchKernel<<<blocks, threadsPerBlock>>>(d_startXBatch, d_startYBatch, d_stepX, d_stepY, groupSize, batchCount, (uint8_t*)d_hits);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    err = cudaMemcpy(outHits, d_hits, (size_t)total, cudaMemcpyDeviceToHost);
+    const auto t1 = std::chrono::steady_clock::now();
+    const uint64_t dn = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    g_legacyGroupCheckNanos.fetch_add(dn, std::memory_order_relaxed);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+// ============================================================================
+// Legacy bloom_check() compatibility (XXH64-based)
+// ============================================================================
+
+__device__ __forceinline__ uint64_t rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+__device__ __forceinline__ uint64_t read64_le(const uint8_t* p) {
+    return ((uint64_t)p[0]) |
+           ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) |
+           ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) |
+           ((uint64_t)p[7] << 56);
+}
+
+__device__ __forceinline__ uint64_t read32_le(const uint8_t* p) {
+    return ((uint64_t)p[0]) |
+           ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24);
+}
+
+__device__ __forceinline__ uint64_t xxh64_round(uint64_t acc, uint64_t input) {
+    const uint64_t PRIME64_1 = 11400714785074694791ULL;
+    const uint64_t PRIME64_2 = 14029467366897019727ULL;
+    acc += input * PRIME64_2;
+    acc = rotl64(acc, 31);
+    acc *= PRIME64_1;
+    return acc;
+}
+
+__device__ __forceinline__ uint64_t xxh64_merge_round(uint64_t acc, uint64_t val) {
+    const uint64_t PRIME64_1 = 11400714785074694791ULL;
+    const uint64_t PRIME64_4 = 9650029242287828579ULL;
+    acc ^= xxh64_round(0, val);
+    acc *= PRIME64_1;
+    acc += PRIME64_4;
+    return acc;
+}
+
+__device__ __forceinline__ uint64_t xxh64_avalanche(uint64_t h64) {
+    const uint64_t PRIME64_2 = 14029467366897019727ULL;
+    const uint64_t PRIME64_3 = 1609587929392839161ULL;
+    h64 ^= h64 >> 33;
+    h64 *= PRIME64_2;
+    h64 ^= h64 >> 29;
+    h64 *= PRIME64_3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+
+__device__ __forceinline__ uint64_t xxh64(const void* input, int len, uint64_t seed) {
+    const uint8_t* p = (const uint8_t*)input;
+    const uint8_t* bEnd = p + len;
+    const uint64_t PRIME64_1 = 11400714785074694791ULL;
+    const uint64_t PRIME64_2 = 14029467366897019727ULL;
+    const uint64_t PRIME64_3 = 1609587929392839161ULL;
+    const uint64_t PRIME64_4 = 9650029242287828579ULL;
+    const uint64_t PRIME64_5 = 2870177450012600261ULL;
+
+    uint64_t h64;
+    if (len >= 32) {
+        const uint8_t* const limit = bEnd - 32;
+        uint64_t v1 = seed + PRIME64_1 + PRIME64_2;
+        uint64_t v2 = seed + PRIME64_2;
+        uint64_t v3 = seed + 0;
+        uint64_t v4 = seed - PRIME64_1;
+
+        do {
+            v1 = xxh64_round(v1, read64_le(p)); p += 8;
+            v2 = xxh64_round(v2, read64_le(p)); p += 8;
+            v3 = xxh64_round(v3, read64_le(p)); p += 8;
+            v4 = xxh64_round(v4, read64_le(p)); p += 8;
+        } while (p <= limit);
+
+        h64 = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        h64 = xxh64_merge_round(h64, v1);
+        h64 = xxh64_merge_round(h64, v2);
+        h64 = xxh64_merge_round(h64, v3);
+        h64 = xxh64_merge_round(h64, v4);
+    } else {
+        h64 = seed + PRIME64_5;
+    }
+
+    h64 += (uint64_t)len;
+
+    while (p + 8 <= bEnd) {
+        uint64_t k1 = xxh64_round(0, read64_le(p));
+        h64 ^= k1;
+        h64 = rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+        p += 8;
+    }
+
+    if (p + 4 <= bEnd) {
+        h64 ^= read32_le(p) * PRIME64_1;
+        h64 = rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+        p += 4;
+    }
+
+    while (p < bEnd) {
+        h64 ^= (*p) * PRIME64_5;
+        h64 = rotl64(h64, 11) * PRIME64_1;
+        p++;
+    }
+
+    return xxh64_avalanche(h64);
+}
+
+__device__ __forceinline__ int bloom_test_bit(const uint8_t* bf, uint64_t bit) {
+    uint64_t byte = bit >> 3;
+    uint8_t c = bf[byte];
+    uint8_t mask = (uint8_t)(1u << (bit & 7u));
+    return (c & mask) ? 1 : 0;
+}
+__device__ __forceinline__ int bloom_check_compat(
+    const uint8_t* bf,
+    uint64_t bits,
+    uint8_t hashes,
+    const void* buffer,
+    int len
+) {
+    uint64_t a = xxh64(buffer, len, 0x59f2815b16f81798ULL);
+    uint64_t b = xxh64(buffer, len, a);
+
+    for (uint8_t i = 0; i < hashes; i++) {
+        uint64_t x = (a + (uint64_t)b * (uint64_t)i) % bits;
+        if (!bloom_test_bit(bf, x)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static __device__ __forceinline__ void u256_to_raw32_be(const uint256_t* x, uint8_t out[32]) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t limb = x->limbs[7 - i];
+        out[i * 4 + 0] = (uint8_t)(limb >> 24);
+        out[i * 4 + 1] = (uint8_t)(limb >> 16);
+        out[i * 4 + 2] = (uint8_t)(limb >> 8);
+        out[i * 4 + 3] = (uint8_t)(limb);
+    }
+}
+
+__global__ void legacyGiantGroupBloomKernel(
+    const uint32_t* startX, const uint32_t* startY,
+    const uint32_t* stepX, const uint32_t* stepY,
+    int groupSize,
+    uint8_t* outHits
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= groupSize) return;
+
+    Point start;
+    Point step;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        start.x.limbs[i] = startX[i];
+        start.y.limbs[i] = startY[i];
+        step.x.limbs[i] = stepX[i];
+        step.y.limbs[i] = stepY[i];
+    }
+    start.z.limbs[0] = 1;
+    step.z.limbs[0] = 1;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        start.z.limbs[i] = 0;
+        step.z.limbs[i] = 0;
+    }
+
+    int half = groupSize / 2;
+    int offset = tid - half;
+
+    Point cur;
+    copy256(&cur.x, &start.x);
+    copy256(&cur.y, &start.y);
+    copy256(&cur.z, &start.z);
+
+    if (offset != 0) {
+        uint256_t k;
+        uint32_t a = (uint32_t)((offset < 0) ? -offset : offset);
+        k.limbs[0] = a;
+        #pragma unroll
+        for (int i = 1; i < 8; i++) k.limbs[i] = 0;
+
+        Point stepUse;
+        copy256(&stepUse.x, &step.x);
+        copy256(&stepUse.y, &step.y);
+        copy256(&stepUse.z, &step.z);
+
+        if (offset < 0) {
+            uint256_t p;
+            set256FromConst(&p, SECP256K1_P);
+            modSub(&stepUse.y, &p, &stepUse.y);
+        }
+
+        Point mul;
+        scalarMult(&mul, &k, &stepUse);
+        pointAdd(&cur, &cur, &mul);
+    }
+
+    Point affine;
+    copy256(&affine.x, &cur.x);
+    copy256(&affine.y, &cur.y);
+    copy256(&affine.z, &cur.z);
+    toAffine(&affine);
+
+    uint8_t raw[32];
+    u256_to_raw32_be(&affine.x, raw);
+
+    if (g_bloomFlat == nullptr || g_bloomBytesPer == 0 || g_bloomBits == 0 || g_bloomHashes == 0) {
+        outHits[tid] = 0;
+        return;
+    }
+
+    uint8_t bucket = raw[0];
+    const uint8_t* bf = g_bloomFlat + ((size_t)bucket * (size_t)g_bloomBytesPer);
+    int r = bloom_check_compat(bf, g_bloomBits, g_bloomHashes, raw, 32);
+    outHits[tid] = (uint8_t)r;
+}
+
+__global__ void legacyGiantGroupBloomBatchKernel(
+    const uint32_t* startXBatch, const uint32_t* startYBatch,
+    const uint32_t* stepX, const uint32_t* stepY,
+    int groupSize,
+    int batchCount,
+    uint8_t* outHits
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = groupSize * batchCount;
+    if (tid >= total) return;
+
+    int batchIdx = tid / groupSize;
+    int localTid = tid - (batchIdx * groupSize);
+
+    const uint32_t* startX = startXBatch + ((size_t)batchIdx * 8u);
+    const uint32_t* startY = startYBatch + ((size_t)batchIdx * 8u);
+
+    Point start;
+    Point step;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        start.x.limbs[i] = startX[i];
+        start.y.limbs[i] = startY[i];
+        step.x.limbs[i] = stepX[i];
+        step.y.limbs[i] = stepY[i];
+    }
+    start.z.limbs[0] = 1;
+    step.z.limbs[0] = 1;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        start.z.limbs[i] = 0;
+        step.z.limbs[i] = 0;
+    }
+
+    int half = groupSize / 2;
+    int offset = localTid - half;
+
+    Point cur;
+    copy256(&cur.x, &start.x);
+    copy256(&cur.y, &start.y);
+    copy256(&cur.z, &start.z);
+
+    if (offset != 0) {
+        uint256_t k;
+        uint32_t a = (uint32_t)((offset < 0) ? -offset : offset);
+        k.limbs[0] = a;
+        #pragma unroll
+        for (int i = 1; i < 8; i++) k.limbs[i] = 0;
+
+        Point stepUse;
+        copy256(&stepUse.x, &step.x);
+        copy256(&stepUse.y, &step.y);
+        copy256(&stepUse.z, &step.z);
+
+        if (offset < 0) {
+            uint256_t p;
+            set256FromConst(&p, SECP256K1_P);
+            modSub(&stepUse.y, &p, &stepUse.y);
+        }
+
+        Point mul;
+        scalarMult(&mul, &k, &stepUse);
+        pointAdd(&cur, &cur, &mul);
+    }
+
+    Point affine;
+    copy256(&affine.x, &cur.x);
+    copy256(&affine.y, &cur.y);
+    copy256(&affine.z, &cur.z);
+    toAffine(&affine);
+
+    uint8_t raw[32];
+    u256_to_raw32_be(&affine.x, raw);
+
+    if (g_bloomFlat == nullptr || g_bloomBytesPer == 0 || g_bloomBits == 0 || g_bloomHashes == 0) {
+        outHits[tid] = 0;
+        return;
+    }
+
+    uint8_t bucket = raw[0];
+    const uint8_t* bf = g_bloomFlat + ((size_t)bucket * (size_t)g_bloomBytesPer);
+    int r = bloom_check_compat(bf, g_bloomBits, g_bloomHashes, raw, 32);
+    outHits[tid] = (uint8_t)r;
+}
+
+// ============================================================================
+// Device-resident legacy bloom filters (256-way bucketed)
+// ============================================================================
+
+__device__ __managed__ uint8_t* g_bloomFlat = nullptr;
+__device__ __managed__ uint64_t g_bloomBytesPer = 0;
+__device__ __managed__ uint64_t g_bloomBits = 0;
+__device__ __managed__ uint8_t g_bloomHashes = 0;
+
+__global__ void bloomCheckBatchKernel(const uint8_t* values32, uint32_t count, uint8_t* outHits) {
+    uint32_t tid = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= count) return;
+
+    const uint8_t* v = values32 + ((size_t)tid * 32u);
+    uint8_t bucket = v[0];
+
+    if (g_bloomFlat == nullptr || g_bloomBytesPer == 0 || g_bloomBits == 0 || g_bloomHashes == 0) {
+        outHits[tid] = 0;
+        return;
+    }
+
+    const uint8_t* bf = g_bloomFlat + ((size_t)bucket * (size_t)g_bloomBytesPer);
+    int r = bloom_check_compat(bf, g_bloomBits, g_bloomHashes, v, 32);
+    outHits[tid] = (uint8_t)r;
+}
 
 // ============================================================================
 // Hash function for X coordinate (for bloom-like lookup)
@@ -257,15 +1067,293 @@ int keyhunt_cudaGetDeviceCount() {
     return count;
 }
 
-// Allocate GPU memory for BSGS
-void* cudaAllocateBSGSMemory(size_t size) {
-    void* ptr;
-    cudaError_t err = cudaMalloc(&ptr, size);
+// Upload legacy 256-way bloom filter (flattened bf arrays)
+int keyhunt_cudaSetBloom(const uint8_t* bloomFlat, uint64_t bytesPerBloom, uint64_t bits, uint8_t hashes) {
+    if (bloomFlat == NULL || bytesPerBloom == 0 || bits == 0 || hashes == 0) {
+        return -1;
+    }
+
+    size_t total = (size_t)256u * (size_t)bytesPerBloom;
+    if (g_bloomFlat != nullptr) {
+        cudaFree(g_bloomFlat);
+        g_bloomFlat = nullptr;
+    }
+
+    cudaError_t err = cudaMalloc((void**)&g_bloomFlat, total);
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Malloc Error: %s\n", cudaGetErrorString(err));
-        return NULL;
+        return -1;
     }
-    return ptr;
+
+    err = cudaMemcpy(g_bloomFlat, bloomFlat, total, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Memcpy Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    g_bloomBytesPer = bytesPerBloom;
+    g_bloomBits = bits;
+    g_bloomHashes = hashes;
+    return 0;
+}
+
+// Batch bloom check for legacy rawvalue[32] buffers
+int keyhunt_cudaBloomCheckBatch(const uint8_t* values32, uint32_t count, uint8_t* outHits) {
+    if (values32 == NULL || outHits == NULL || count == 0) {
+        return -1;
+    }
+
+    uint8_t* d_values = nullptr;
+    uint8_t* d_hits = nullptr;
+    size_t valuesBytes = (size_t)count * 32u;
+
+    cudaError_t err = cudaMalloc((void**)&d_values, valuesBytes);
+    if (err != cudaSuccess) return -1;
+    err = cudaMalloc((void**)&d_hits, (size_t)count);
+    if (err != cudaSuccess) {
+        cudaFree(d_values);
+        return -1;
+    }
+
+    err = cudaMemcpy(d_values, values32, valuesBytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_values);
+        cudaFree(d_hits);
+        return -1;
+    }
+
+    int threads = 256;
+    int blocks = (int)((count + (uint32_t)threads - 1u) / (uint32_t)threads);
+    bloomCheckBatchKernel<<<blocks, threads>>>(d_values, count, d_hits);
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_values);
+        cudaFree(d_hits);
+        return -1;
+    }
+
+    err = cudaMemcpy(outHits, d_hits, (size_t)count, cudaMemcpyDeviceToHost);
+    cudaFree(d_values);
+    cudaFree(d_hits);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+// Allocate reusable device buffers for bloom batch checking
+int keyhunt_cudaBloomBatchAlloc(uint32_t maxCount, void** d_values, void** d_hits) {
+    if (maxCount == 0 || d_values == NULL || d_hits == NULL) {
+        return -1;
+    }
+
+    uint8_t* dv = nullptr;
+    uint8_t* dh = nullptr;
+    cudaError_t err = cudaMalloc((void**)&dv, (size_t)maxCount * 32u);
+    if (err != cudaSuccess) return -1;
+    err = cudaMalloc((void**)&dh, (size_t)maxCount);
+    if (err != cudaSuccess) {
+        cudaFree(dv);
+        return -1;
+    }
+
+    *d_values = (void*)dv;
+    *d_hits = (void*)dh;
+    return 0;
+}
+
+int keyhunt_cudaBloomBatchFree(void* d_values, void* d_hits) {
+    if (d_values) cudaFree(d_values);
+    if (d_hits)    cudaFree(d_hits);
+
+    return 0;
+}
+
+extern "C" int keyhunt_cudaLegacyDebugScalarMultX(
+    const uint32_t stepX[8], const uint32_t stepY[8],
+    uint32_t k_scalar,
+    uint8_t outX32[32]
+) {
+    uint32_t* d_stepX = nullptr;
+    uint32_t* d_stepY = nullptr;
+    uint8_t* d_out = nullptr;
+
+    cudaError_t err;
+    err = cudaMalloc((void**)&d_stepX, 8u * sizeof(uint32_t));
+    if (err != cudaSuccess) return -1;
+    err = cudaMalloc((void**)&d_stepY, 8u * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        cudaFree(d_stepX);
+        return -1;
+    }
+    err = cudaMalloc((void**)&d_out, 32u);
+    if (err != cudaSuccess) {
+        cudaFree(d_stepX);
+        cudaFree(d_stepY);
+        return -1;
+    }
+
+    err = cudaMemcpy(d_stepX, stepX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_stepX);
+        cudaFree(d_stepY);
+        cudaFree(d_out);
+        return -1;
+    }
+    err = cudaMemcpy(d_stepY, stepY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_stepX);
+        cudaFree(d_stepY);
+        cudaFree(d_out);
+        return -1;
+    }
+
+    legacyDebugScalarMultXKernel<<<1, 1>>>(d_stepX, d_stepY, k_scalar, d_out);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        cudaFree(d_stepX);
+        cudaFree(d_stepY);
+        cudaFree(d_out);
+        return -1;
+    }
+
+    err = cudaMemcpy(outX32, d_out, 32u, cudaMemcpyDeviceToHost);
+    cudaFree(d_stepX);
+    cudaFree(d_stepY);
+    cudaFree(d_out);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+// Run bloom check using reusable device buffers (copies inputs/outputs)
+int keyhunt_cudaBloomBatchRun(void* d_values, void* d_hits, const uint8_t* values32, uint32_t count, uint8_t* outHits) {
+    if (d_values == NULL || d_hits == NULL || values32 == NULL || outHits == NULL || count == 0) {
+        return -1;
+    }
+
+    cudaError_t err = cudaMemcpy(d_values, values32, (size_t)count * 32u, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    int threads = 256;
+    int blocks = (int)((count + (uint32_t)threads - 1u) / (uint32_t)threads);
+    bloomCheckBatchKernel<<<blocks, threads>>>((const uint8_t*)d_values, count, (uint8_t*)d_hits);
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    err = cudaMemcpy(outHits, d_hits, (size_t)count, cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+int keyhunt_cudaLegacyGroupCheck(
+    const uint32_t startX[8], const uint32_t startY[8],
+    const uint32_t stepX[8], const uint32_t stepY[8],
+    int groupSize,
+    void* d_hits,
+    uint8_t* outHits,
+    int threadsPerBlock,
+    int numBlocks
+) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (startX == NULL || startY == NULL || stepX == NULL || stepY == NULL || d_hits == NULL || outHits == NULL) {
+        return -1;
+    }
+    if (groupSize <= 0) {
+        return -1;
+    }
+
+     g_legacyGroupCheckCalls.fetch_add(1u, std::memory_order_relaxed);
+     g_legacyGroupCheckPoints.fetch_add((uint64_t)groupSize, std::memory_order_relaxed);
+
+    int blocks = 0;
+
+    // Avoid per-call device allocations by reusing per-host-thread buffers.
+    // keyhunt_legacy launches this from multiple CPU threads; thread_local keeps them independent.
+    static thread_local uint32_t* d_startX = nullptr;
+    static thread_local uint32_t* d_startY = nullptr;
+    static thread_local uint32_t* d_stepX  = nullptr;
+    static thread_local uint32_t* d_stepY  = nullptr;
+
+    cudaError_t err = cudaSuccess;
+    if (d_startX == nullptr) {
+        err = cudaMalloc((void**)&d_startX, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_startY, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_stepX, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+        err = cudaMalloc((void**)&d_stepY, 8u * sizeof(uint32_t));
+        if (err != cudaSuccess) return -1;
+    }
+
+    err = cudaMemcpy(d_startX, startX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_startY, startY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_stepX, stepX, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(d_stepY, stepY, 8u * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    if (threadsPerBlock <= 0) threadsPerBlock = 256;
+    if (threadsPerBlock > 1024) threadsPerBlock = 1024;
+
+    const int requiredBlocks = (groupSize + threadsPerBlock - 1) / threadsPerBlock;
+    blocks = numBlocks;
+    if (blocks <= 0) {
+        blocks = requiredBlocks;
+    } else if (blocks > requiredBlocks) {
+        blocks = requiredBlocks;
+    }
+
+    legacyGiantGroupBloomKernel<<<blocks, threadsPerBlock>>>(d_startX, d_startY, d_stepX, d_stepY, groupSize, (uint8_t*)d_hits);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    err = cudaMemcpy(outHits, d_hits, (size_t)groupSize, cudaMemcpyDeviceToHost);
+    const auto t1 = std::chrono::steady_clock::now();
+    const uint64_t dn = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    g_legacyGroupCheckNanos.fetch_add(dn, std::memory_order_relaxed);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+int keyhunt_cudaBloomBatchRunConfig(void* d_values, void* d_hits, const uint8_t* values32, uint32_t count, uint8_t* outHits, int threadsPerBlock, int numBlocks) {
+    if (d_values == NULL || d_hits == NULL || values32 == NULL || outHits == NULL || count == 0) {
+        return -1;
+    }
+
+    if (threadsPerBlock <= 0) {
+        threadsPerBlock = 256;
+    }
+    if (threadsPerBlock > 1024) {
+        threadsPerBlock = 1024;
+    }
+
+    cudaError_t err = cudaMemcpy(d_values, values32, (size_t)count * 32u, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    const int requiredBlocks = (int)((count + (uint32_t)threadsPerBlock - 1u) / (uint32_t)threadsPerBlock);
+    int blocks = numBlocks;
+    if (blocks <= 0) {
+        blocks = requiredBlocks;
+    } else if (blocks > requiredBlocks) {
+        blocks = requiredBlocks;
+    }
+
+    bloomCheckBatchKernel<<<blocks, threadsPerBlock>>>((const uint8_t*)d_values, count, (uint8_t*)d_hits);
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    err = cudaMemcpy(outHits, d_hits, (size_t)count, cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? 0 : -1;
 }
 
 // Free GPU memory

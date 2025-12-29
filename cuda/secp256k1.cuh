@@ -57,7 +57,7 @@ __constant__ uint32_t SECP256K1_GX[8] = {
 
 // Generator point G.y
 __constant__ uint32_t SECP256K1_GY[8] = {
-    0xFB10D4B8, 0x9C47D08F, 0xA6855419, 0xFD17B448,
+    0xFB10D4B8, 0x9C47D08F, 0x0A685541, 0xFD17B448,
     0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77
 };
 
@@ -66,12 +66,21 @@ __constant__ uint32_t SECP256K1_GY[8] = {
 // ============================================================================
 
 // Add two 256-bit numbers: r = a + b (returns carry)
+// Handles aliasing (r may equal a and/or b)
 __device__ __forceinline__ uint32_t add256(uint256_t* r, const uint256_t* a, const uint256_t* b) {
-    uint64_t carry = 0;
-
+    // Read inputs first to handle aliasing
+    uint32_t av[8], bv[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        carry += (uint64_t)a->limbs[i] + (uint64_t)b->limbs[i];
+        av[i] = a->limbs[i];
+        bv[i] = b->limbs[i];
+    }
+    
+    // Simple loop with carry propagation (same as original, but using copied inputs)
+    uint64_t carry = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        carry += (uint64_t)av[i] + (uint64_t)bv[i];
         r->limbs[i] = (uint32_t)carry;
         carry >>= 32;
     }
@@ -80,12 +89,21 @@ __device__ __forceinline__ uint32_t add256(uint256_t* r, const uint256_t* a, con
 }
 
 // Subtract two 256-bit numbers: r = a - b (returns borrow)
+// Handles aliasing (r may equal a and/or b)
 __device__ __forceinline__ uint32_t sub256(uint256_t* r, const uint256_t* a, const uint256_t* b) {
-    int64_t borrow = 0;
-
+    // Read inputs first to handle aliasing
+    uint32_t av[8], bv[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        borrow = (int64_t)a->limbs[i] - (int64_t)b->limbs[i] + borrow;
+        av[i] = a->limbs[i];
+        bv[i] = b->limbs[i];
+    }
+    
+    // Simple loop with borrow propagation (same as original, but using copied inputs)
+    int64_t borrow = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        borrow = (int64_t)av[i] - (int64_t)bv[i] + borrow;
         r->limbs[i] = (uint32_t)borrow;
         borrow >>= 32;
     }
@@ -175,60 +193,92 @@ __device__ void modSub(uint256_t* r, const uint256_t* a, const uint256_t* b) {
 }
 
 // Modular multiplication: r = (a * b) mod p
-// Uses schoolbook multiplication with 32-bit limbs
+// Uses schoolbook multiplication with secp256k1-optimized reduction
+// secp256k1: p = 2^256 - 0x1000003D1, so 2^256 ≡ 0x1000003D1 (mod p)
 __device__ void modMul(uint256_t* r, const uint256_t* a, const uint256_t* b) {
-    uint64_t product[16] = {0};  // 512-bit intermediate result
-
-    // Schoolbook multiplication
-    #pragma unroll
+    // Use 64-bit accumulators for 512-bit product
+    // t[i] holds the contribution to limb i (can accumulate beyond 32 bits)
+    uint64_t t[17] = {0};  // Extra limb for overflow
+    
+    // Schoolbook multiplication: accumulate all products
     for (int i = 0; i < 8; i++) {
-        uint64_t carry = 0;
-        #pragma unroll
+        uint64_t ai = a->limbs[i];
         for (int j = 0; j < 8; j++) {
-            uint64_t mul = (uint64_t)a->limbs[i] * (uint64_t)b->limbs[j];
-            uint64_t sum = product[i + j] + mul + carry;
-            product[i + j] = sum & 0xFFFFFFFF;
-            carry = sum >> 32;
+            t[i + j] += ai * (uint64_t)b->limbs[j];
         }
-        product[i + 8] = carry;
     }
-
-    // Reduction using secp256k1 special form
-    // p = 2^256 - 2^32 - 977 = 2^256 - c where c = 0x1000003D1
-    const uint64_t c = 0x1000003D1ULL;
-
-    // Reduce high 256 bits
-    uint64_t carry = 0;
-    #pragma unroll
+    
+    // Propagate carries to get proper 32-bit limbs
+    for (int i = 0; i < 16; i++) {
+        t[i + 1] += t[i] >> 32;
+        t[i] &= 0xFFFFFFFF;
+    }
+    
+    // secp256k1 reduction: 2^256 ≡ c (mod p), where c = 0x1000003D1
+    // R = R_low + R_high * 2^256 ≡ R_low + R_high * c (mod p)
+    // 
+    // We compute: result = t[0..7] + t[8..15] * c
+    // where c = 0x1000003D1 = 4294968273
+    //
+    // t[8..15] * c can overflow, so we need multiple passes
+    
+    const uint64_t C_LO = 977ULL;      // Low part: 0x3D1
+    const uint64_t C_HI = 1ULL;        // High part: 1 (representing 2^32)
+    
+    for (int pass = 0; pass < 3; pass++) {
+        // Check if reduction needed
+        uint64_t has_high = 0;
+        for (int i = 8; i < 17; i++) has_high |= t[i];
+        if (has_high == 0) break;
+        
+        // Compute contribution: high * c
+        // Split into: high * C_LO + high * C_HI * 2^32
+        // high * C_LO goes to same position
+        // high * C_HI * 2^32 = high shifted left by 1 limb
+        
+        uint64_t contrib[9] = {0};  // Contribution to t[0..8]
+        
+        for (int i = 0; i < 8; i++) {
+            uint64_t hi = t[i + 8];
+            contrib[i] += hi * C_LO;           // hi * 977
+            contrib[i + 1] += hi * C_HI;       // hi * 1 (shifted)
+        }
+        // Handle t[16] if present
+        if (t[16]) {
+            // t[16] * 2^512 ≡ t[16] * c^2 (mod p)
+            // c^2 = (2^32 + 977)^2 = 2^64 + 2*977*2^32 + 977^2
+            //     = 2^64 + 1954*2^32 + 954529
+            // This goes to t[0], t[1], t[2]
+            uint64_t hi16 = t[16];
+            contrib[0] += hi16 * 954529ULL;         // 977^2
+            contrib[1] += hi16 * 1954ULL;           // 2 * 977
+            contrib[2] += hi16;                      // 1 (from 2^64)
+        }
+        
+        // Clear high limbs
+        for (int i = 8; i < 17; i++) t[i] = 0;
+        
+        // Add contributions to low limbs
+        for (int i = 0; i < 9; i++) {
+            t[i] += contrib[i];
+        }
+        
+        // Propagate carries
+        for (int i = 0; i < 16; i++) {
+            t[i + 1] += t[i] >> 32;
+            t[i] &= 0xFFFFFFFF;
+        }
+    }
+    
+    // Copy result
     for (int i = 0; i < 8; i++) {
-        uint64_t sum = product[i] + product[i + 8] * c + carry;
-        product[i] = sum & 0xFFFFFFFF;
-        carry = sum >> 32;
+        r->limbs[i] = (uint32_t)t[i];
     }
-
-    // Handle remaining carry
-    while (carry) {
-        uint64_t sum = product[0] + carry * c;
-        product[0] = sum & 0xFFFFFFFF;
-        carry = sum >> 32;
-
-        for (int i = 1; i < 8 && carry; i++) {
-            sum = product[i] + carry;
-            product[i] = sum & 0xFFFFFFFF;
-            carry = sum >> 32;
-        }
-    }
-
-    // Final reduction if needed
+    
+    // Final reduction: ensure r < p
     uint256_t p;
     set256FromConst(&p, SECP256K1_P);
-
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        r->limbs[i] = (uint32_t)product[i];
-    }
-
-    if (cmp256(r, &p) >= 0) {
+    while (cmp256(r, &p) >= 0) {
         sub256(r, r, &p);
     }
 }
@@ -285,18 +335,19 @@ __device__ void pointDouble(Point* R, const Point* P) {
         return;
     }
 
-    uint256_t S, M, T, Y2, Z2;
+    uint256_t S, M, T, Y2, Stmp;
 
     // S = 4*X*Y^2
     modSqr(&Y2, &P->y);
     modMul(&S, &P->x, &Y2);
-    modAdd(&S, &S, &S);
-    modAdd(&S, &S, &S);
+    // Avoid aliasing: use temp for doubling
+    modAdd(&Stmp, &S, &S);      // Stmp = 2*S
+    modAdd(&S, &Stmp, &Stmp);   // S = 4*S (original)
 
     // M = 3*X^2 (since a=0 for secp256k1)
     modSqr(&M, &P->x);
-    modAdd(&T, &M, &M);
-    modAdd(&M, &T, &M);
+    modAdd(&T, &M, &M);         // T = 2*M (no aliasing here)
+    modAdd(&M, &T, &M);         // M = 3*M (no aliasing here)
 
     // X' = M^2 - 2*S
     modSqr(&R->x, &M);
@@ -306,15 +357,19 @@ __device__ void pointDouble(Point* R, const Point* P) {
     // Y' = M*(S - X') - 8*Y^4
     modSub(&T, &S, &R->x);
     modMul(&R->y, &M, &T);
-    modSqr(&T, &Y2);
-    modAdd(&T, &T, &T);
-    modAdd(&T, &T, &T);
-    modAdd(&T, &T, &T);
-    modSub(&R->y, &R->y, &T);
+    modSqr(&T, &Y2);            // T = Y^4
+    // 8*Y^4 using explicit temp to avoid aliasing
+    uint256_t T2;
+    modAdd(&T2, &T, &T);        // T2 = 2*Y^4
+    modAdd(&T, &T2, &T2);       // T = 4*Y^4
+    modAdd(&T2, &T, &T);        // T2 = 8*Y^4
+    modSub(&R->y, &R->y, &T2);
 
     // Z' = 2*Y*Z
     modMul(&R->z, &P->y, &P->z);
-    modAdd(&R->z, &R->z, &R->z);
+    uint256_t Zcopy;
+    copy256(&Zcopy, &R->z);
+    modAdd(&R->z, &Zcopy, &Zcopy);
 }
 
 // Point addition: R = P + Q (P != Q)

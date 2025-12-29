@@ -29,6 +29,7 @@ email: albertobsd@gmail.com
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <getopt.h>
 #include <pthread.h>
 #include <sys/random.h>
 #endif
@@ -284,6 +285,10 @@ int FLAGBSGSMODE = 0;
 int FLAGDEBUG = 0;
 int FLAGQUIET = 0;
 int FLAGMATRIX = 0;
+int FLAGGPU = 0;
+int GPU_DEVICE = 0;
+int GPU_THREADS = 256;
+int GPU_BLOCKS = 0;
 int KFACTOR = 1;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
@@ -368,6 +373,8 @@ const char *str_limits_prefixs[7] = {"Mkeys/s","Gkeys/s","Tkeys/s","Pkeys/s","Ek
 const char *str_limits[7] = {"1000000","1000000000","1000000000000","1000000000000000","1000000000000000000","1000000000000000000000","1000000000000000000000000"};
 Int int_limits[7];
 
+int GPU_BATCH = 16;
+
 
 
 
@@ -413,7 +420,56 @@ Int lambda,lambda2,beta,beta2;
 
 Secp256K1 *secp;
 
-int main(int argc, char **argv)	{
+#ifdef CUDA_ENABLED
+extern "C" {
+int cudaInit(int deviceId);
+int keyhunt_cudaGetDeviceCount();
+int keyhunt_cudaSetBloom(const uint8_t* bloomFlat, uint64_t bytesPerBloom, uint64_t bits, uint8_t hashes);
+int keyhunt_cudaBloomBatchAlloc(uint32_t maxCount, void** d_values, void** d_hits);
+int keyhunt_cudaBloomBatchFree(void* d_values, void* d_hits);
+int keyhunt_cudaBloomBatchRun(void* d_values, void* d_hits, const uint8_t* values32, uint32_t count, uint8_t* outHits);
+int keyhunt_cudaBloomBatchRunConfig(void* d_values, void* d_hits, const uint8_t* values32, uint32_t count, uint8_t* outHits, int threadsPerBlock, int numBlocks);
+void keyhunt_cudaGetLegacyGroupCheckStats(uint64_t* calls, uint64_t* points, uint64_t* nanos);
+int keyhunt_cudaLegacyDebugFirstX(
+	const uint32_t startX[8], const uint32_t startY[8],
+	const uint32_t stepX[8], const uint32_t stepY[8],
+	int groupSize,
+	uint8_t outX32[32]
+);
+int keyhunt_cudaLegacyDebugScalarMultX(
+	const uint32_t stepX[8], const uint32_t stepY[8],
+	uint32_t k_scalar,
+	uint8_t outX32[32]
+);
+int keyhunt_cudaTestPointDouble(
+	int* x_match, int* y_match,
+	uint32_t computed_2gx[8], uint32_t computed_2gy[8],
+	int* add_test1, int* add_test2, int* add_test3, uint32_t* add_result,
+	uint32_t jacobian_y[8], uint32_t jacobian_z[8]
+);
+int keyhunt_cudaLegacyGroupCheck(
+	const uint32_t startX[8], const uint32_t startY[8],
+	const uint32_t stepX[8], const uint32_t stepY[8],
+	int groupSize,
+	void* d_hits,
+	uint8_t* outHits,
+	int threadsPerBlock,
+	int numBlocks
+);
+int keyhunt_cudaLegacyGroupCheckBatch(
+	const uint32_t* startXBatch, const uint32_t* startYBatch,
+	int batchCount,
+	const uint32_t stepX[8], const uint32_t stepY[8],
+	int groupSize,
+	void* d_hits,
+	uint8_t* outHits,
+	int threadsPerBlock,
+	int numBlocks
+);
+}
+#endif
+
+int main(int argc, char **argv) 	{
 	char buffer[2048];
 	char rawvalue[32];
 	struct tothread *tt;	//tothread
@@ -489,10 +545,38 @@ int main(int argc, char **argv)	{
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
+	static struct option long_options[] = {
+		{"gpu", no_argument, 0, 1000},
+		{"gpu-threads", required_argument, 0, 1001},
+		{"gpu-blocks", required_argument, 0, 1002},
+		{"gpu-batch", required_argument, 0, 1003},
+		{0, 0, 0, 0}
+	};
+
+	while ((c = getopt_long(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:g:", long_options, NULL)) != -1) {
 		switch(c) {
 			case 'h':
 				menu();
+			break;
+			case 1000:
+				FLAGGPU = 1;
+			break;
+			case 1001:
+				GPU_THREADS = (int)strtol(optarg,NULL,10);
+				if(GPU_THREADS <= 0) {
+					GPU_THREADS = 256;
+				}
+			break;
+			case 1002:
+				GPU_BLOCKS = (int)strtol(optarg,NULL,10);
+				if(GPU_BLOCKS < 0) {
+					GPU_BLOCKS = 0;
+				}
+			break;
+			case 1003:
+				GPU_BATCH = (int)strtol(optarg,NULL,10);
+				if(GPU_BATCH <= 0) GPU_BATCH = 1;
+				if(GPU_BATCH > 1024) GPU_BATCH = 1024;
 			break;
 			case '6':
 				FLAGSKIPCHECKSUM = 1;
@@ -765,6 +849,12 @@ int main(int argc, char **argv)	{
 					exit(EXIT_FAILURE);
 				}
 			break;
+			case 'g':
+				GPU_DEVICE = (int)strtol(optarg,NULL,10);
+				if(GPU_DEVICE < 0) {
+					GPU_DEVICE = 0;
+				}
+			break;
 			case 'z':
 				FLAGBLOOMMULTIPLIER= strtol(optarg,NULL,10);
 				if(FLAGBLOOMMULTIPLIER <= 0)	{
@@ -777,6 +867,24 @@ int main(int argc, char **argv)	{
 				exit(EXIT_FAILURE);
 			break;
 		}
+	}
+
+	if(FLAGGPU) {
+		#ifdef CUDA_ENABLED
+			if(keyhunt_cudaGetDeviceCount() <= 0) {
+				fprintf(stderr,"[E] CUDA enabled but no GPU devices detected\n");
+				exit(EXIT_FAILURE);
+			}
+			if(cudaInit(GPU_DEVICE) != 0) {
+				fprintf(stderr,"[E] Failed to initialize CUDA device %d\n",GPU_DEVICE);
+				exit(EXIT_FAILURE);
+			}
+			printf("[CUDA] Enabled (device=%d threads=%d blocks=%d)\n", GPU_DEVICE, GPU_THREADS, GPU_BLOCKS);
+			printf("[CUDA] Batch=%d\n", GPU_BATCH);
+		#else
+			fprintf(stderr,"[E] --gpu requested but this build was compiled without CUDA support. Rebuild with -DKEYHUNT_USE_CUDA=ON\n");
+			exit(EXIT_FAILURE);
+		#endif
 	}
 	//if(FLAGDEBUG) { printf("[D] File: %s Line %i\n",__FILE__,__LINE__); fflush(stdout); }
 	if(  FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM)	{
@@ -1179,6 +1287,13 @@ int main(int argc, char **argv)	{
 
 		bsgs_m = BSGS_M.GetInt64();
 		bsgs_aux = BSGS_AUX.GetInt64();
+		{
+			uint64_t expected_cycles = (uint64_t)(bsgs_aux / 1024u);
+			if((bsgs_aux % 1024u) != 0) expected_cycles++;
+			printf("[BSGS] KFACTOR=%d BSGS_M=%" PRIu64 " BSGS_N=%" PRIu64 " bsgs_aux=%lu expected_cycles=%" PRIu64 "\n",
+			       KFACTOR, (uint64_t)bsgs_m, (uint64_t)BSGS_N.GetInt64(), (unsigned long)bsgs_aux, expected_cycles);
+			fflush(stdout);
+		}
 		
 		BSGS_N_double.SetInt32(2);
 		BSGS_N_double.Mult(&BSGS_N);
@@ -1872,6 +1987,61 @@ int main(int argc, char **argv)	{
 			printf(" done\n");
 			fflush(stdout);
 		}	
+		if(FLAGGPU) {
+			#ifdef CUDA_ENABLED
+				uint64_t bytesPer = bloom_bP[0].bytes;
+				uint64_t bitsPer = bloom_bP[0].bits;
+				uint8_t hashesPer = bloom_bP[0].hashes;
+				uint8_t* flat = (uint8_t*)malloc((size_t)256u * (size_t)bytesPer);
+				checkpointer((void *)flat,__FILE__,"malloc","flat" ,__LINE__ -1 );
+				for(i = 0; i < 256; i++) {
+					if(bloom_bP[i].bytes != bytesPer || bloom_bP[i].bits != bitsPer || bloom_bP[i].hashes != hashesPer) {
+						fprintf(stderr,"[E] Bloom filter layout mismatch at index %i\n", i);
+						exit(EXIT_FAILURE);
+					}
+					memcpy(flat + ((size_t)i * (size_t)bytesPer), bloom_bP[i].bf, (size_t)bytesPer);
+				}
+				if(keyhunt_cudaSetBloom(flat, bytesPer, bitsPer, hashesPer) != 0) {
+					fprintf(stderr,"[E] Failed to upload bloom filter to GPU\n");
+					exit(EXIT_FAILURE);
+				}
+				free(flat);
+				printf("[CUDA] Bloom filter uploaded (256 x %.2f MB)\n", (double)bytesPer / 1048576.0);
+				
+				// Test pointDouble with known G -> 2G
+				{
+					int pd_x_match = -1, pd_y_match = -1;
+					int add_t1 = -1, add_t2 = -1, add_t3 = -1;
+					uint32_t add_res = 0;
+					uint32_t pd_2gx[8], pd_2gy[8];
+					uint32_t jac_y[8], jac_z[8];
+					if(keyhunt_cudaTestPointDouble(&pd_x_match, &pd_y_match, pd_2gx, pd_2gy, &add_t1, &add_t2, &add_t3, &add_res, jac_y, jac_z) == 0) {
+						printf("[CUDA][TEST] modAdd aliasing: 1->2=%d, 2->4=%d, 4->8=%d, final=%u (0x%08x)\n", add_t1, add_t2, add_t3, add_res, add_res);
+						printf("[CUDA][TEST] pointDouble(G)->2G: x_match=%d y_match=%d\n", pd_x_match, pd_y_match);
+						if(pd_x_match != 1 || pd_y_match != 1) {
+							printf("[CUDA][TEST] computed 2G.x = ");
+							for(int i=7; i>=0; i--) printf("%08x", pd_2gx[i]);
+							printf("\n[CUDA][TEST] expected 2G.x = c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\n");
+							printf("[CUDA][TEST] computed 2G.y = ");
+							for(int i=7; i>=0; i--) printf("%08x", pd_2gy[i]);
+							printf("\n[CUDA][TEST] expected 2G.y = 1ae168fea63dc339a3c58419466ceae1061b7cd5f69e89e29fb77f17538bddba\n");
+							printf("[CUDA][TEST] Jacobian Y = ");
+							for(int i=7; i>=0; i--) printf("%08x", jac_y[i]);
+							printf("\n[CUDA][TEST] Jacobian Z = ");
+							for(int i=7; i>=0; i--) printf("%08x", jac_z[i]);
+							printf("\n");
+						} else {
+							printf("[CUDA][TEST] ✅ pointDouble test PASSED!\n");
+						}
+					} else {
+						printf("[CUDA][TEST] pointDouble test FAILED to run\n");
+					}
+				}
+			#else
+				fprintf(stderr,"[E] Internal error: FLAGGPU set without CUDA_ENABLED\n");
+				exit(EXIT_FAILURE);
+			#endif
+		}
 		if(!FLAGREADEDFILE3)	{
 			printf("[+] Sorting %lu elements... ",bsgs_m3);
 			fflush(stdout);
@@ -2182,6 +2352,36 @@ int main(int argc, char **argv)	{
 			MPZAUX.Set(&seconds);
 			MPZAUX.Mod(&OUTPUTSECONDS);
 			if(MPZAUX.IsZero()) {
+				#ifdef CUDA_ENABLED
+				if(FLAGGPU) {
+					uint64_t cuda_calls = 0;
+					uint64_t cuda_points = 0;
+					uint64_t cuda_nanos = 0;
+					static uint64_t last_cuda_calls = 0;
+					static uint64_t last_cuda_points = 0;
+					static uint64_t last_cuda_nanos = 0;
+					keyhunt_cudaGetLegacyGroupCheckStats(&cuda_calls, &cuda_points, &cuda_nanos);
+					uint64_t d_calls = cuda_calls - last_cuda_calls;
+					uint64_t d_points = cuda_points - last_cuda_points;
+					uint64_t d_nanos = cuda_nanos - last_cuda_nanos;
+					last_cuda_calls = cuda_calls;
+					last_cuda_points = cuda_points;
+					last_cuda_nanos = cuda_nanos;
+					double us_per_call_total = 0.0;
+					double us_per_call_interval = 0.0;
+					if(cuda_calls > 0) {
+						us_per_call_total = ((double)cuda_nanos / 1000.0) / (double)cuda_calls;
+					}
+					if(d_calls > 0) {
+						us_per_call_interval = ((double)d_nanos / 1000.0) / (double)d_calls;
+					}
+					printf("[CUDA] legacyGroupCheck calls=%" PRIu64 " (+%" PRIu64 ") points=%" PRIu64 " (+%" PRIu64 ")\n",
+					       cuda_calls, d_calls, cuda_points, d_points);
+					printf("[CUDA] legacyGroupCheck avg_us_per_call total=%.2f interval=%.2f\n",
+					       us_per_call_total, us_per_call_interval);
+					fflush(stdout);
+				}
+				#endif
 				total.SetInt32(0);
 				i = 0;
 				while(i < NTHREADS) {
@@ -2268,6 +2468,18 @@ int main(int argc, char **argv)	{
 			}
 		}
 	}while(continue_flag);
+	#ifdef CUDA_ENABLED
+	if(FLAGGPU) {
+		uint64_t cuda_calls = 0;
+		uint64_t cuda_points = 0;
+		uint64_t cuda_nanos = 0;
+		keyhunt_cudaGetLegacyGroupCheckStats(&cuda_calls, &cuda_points, &cuda_nanos);
+		printf("\n[CUDA] final legacyGroupCheck calls=%" PRIu64 " points=%" PRIu64 " avg_us_per_call=%.2f\n",
+		       cuda_calls, cuda_points,
+		       (cuda_calls ? (((double)cuda_nanos / 1000.0) / (double)cuda_calls) : 0.0));
+		fflush(stdout);
+	}
+	#endif
 	printf("\nEnd\n");
 #ifdef _WIN64
 	CloseHandle(write_keys);
@@ -3111,6 +3323,10 @@ void *thread_process(void *vargp)	{
 		}
 	} while(continue_flag);
 	ends[thread_number] = 1;
+	if(thread_number == 0) {
+		printf("[BSGS][T0] thread exiting (ends[0]=1)\n");
+		fflush(stdout);
+	}
 	return NULL;
 }
 
@@ -3629,8 +3845,12 @@ void *thread_process_vanity(void *vargp)	{
 			}while(count < N_SEQUENTIAL_MAX && continue_flag);
 		}
 	} while(continue_flag);
-	ends[thread_number] = 1;
-	return NULL;
+		if(thread_number == 0) {
+			printf("[BSGS][T0] thread exiting (ends[0]=1, steps[0]=%" PRIu64 ")\n", (uint64_t)steps[0]);
+			fflush(stdout);
+		}
+		ends[thread_number] = 1;
+		return NULL;
 }
 
 void _swap(struct address_value *a,struct address_value *b)	{
@@ -3884,6 +4104,16 @@ void *thread_process_bsgs(void *vargp)	{
 	uint32_t j,k,l,r,salir,thread_number, cycles;
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	Point startP;
+	#ifdef CUDA_ENABLED
+	void* cuda_bloom_d_values = NULL;
+	void* cuda_bloom_d_hits = NULL;
+	#endif
+	uint8_t* cuda_bloom_values = NULL;
+	uint8_t* cuda_bloom_hits = NULL;
+	uint32_t cuda_startX[8], cuda_startY[8], cuda_stepX[8], cuda_stepY[8];
+	Point cuda_stepP;
+	std::vector<uint32_t> startXB;
+	std::vector<uint32_t> startYB;
 	
 	int i,hLength = (CPU_GRP_SIZE / 2 - 1);
 	
@@ -3903,6 +4133,40 @@ void *thread_process_bsgs(void *vargp)	{
 	tt = (struct tothread *)vargp;
 	thread_number = tt->nt;
 	free(tt);
+
+	if(FLAGGPU) {
+		#ifdef CUDA_ENABLED
+			int gpu_batch = GPU_BATCH;
+			if(gpu_batch <= 0) gpu_batch = 1;
+			size_t batchCount = (size_t)gpu_batch;
+			size_t totalGroup = (size_t)CPU_GRP_SIZE * batchCount;
+			cuda_bloom_values = (uint8_t*)malloc(totalGroup * 32u);
+			checkpointer((void *)cuda_bloom_values,__FILE__,"malloc","cuda_bloom_values" ,__LINE__ -1 );
+			cuda_bloom_hits = (uint8_t*)malloc(totalGroup);
+			checkpointer((void *)cuda_bloom_hits,__FILE__,"malloc","cuda_bloom_hits" ,__LINE__ -1 );
+			if(keyhunt_cudaBloomBatchAlloc((uint32_t)totalGroup, &cuda_bloom_d_values, &cuda_bloom_d_hits) != 0) {
+				fprintf(stderr,"[E] Failed to allocate CUDA bloom batch buffers\n");
+				exit(EXIT_FAILURE);
+			}
+			cuda_stepP = BSGS_MP_double;
+			{
+				uint8_t sbx[32];
+				uint8_t sby[32];
+				cuda_stepP.x.Get32Bytes((unsigned char*)sbx);
+				cuda_stepP.y.Get32Bytes((unsigned char*)sby);
+				for(int li = 0; li < 8; li++) {
+					int bo = (7 - li) * 4;
+					cuda_stepX[li] = ((uint32_t)sbx[bo + 0] << 24) | ((uint32_t)sbx[bo + 1] << 16) | ((uint32_t)sbx[bo + 2] << 8) | ((uint32_t)sbx[bo + 3]);
+					cuda_stepY[li] = ((uint32_t)sby[bo + 0] << 24) | ((uint32_t)sby[bo + 1] << 16) | ((uint32_t)sby[bo + 2] << 8) | ((uint32_t)sby[bo + 3]);
+				}
+			}
+			startXB.resize((size_t)gpu_batch * 8u);
+			startYB.resize((size_t)gpu_batch * 8u);
+		#else
+			fprintf(stderr,"[E] Internal error: FLAGGPU set without CUDA_ENABLED\n");
+			exit(EXIT_FAILURE);
+		#endif
+	}
 	
 	cycles = bsgs_aux / 1024;
 	if(bsgs_aux % 1024 != 0)	{
@@ -3913,7 +4177,7 @@ void *thread_process_bsgs(void *vargp)	{
 	intaux.Mult(CPU_GRP_SIZE/2);
 	intaux.Add(&BSGS_M);
 	
-	do	{
+	while(1)	{
 
 	/*
 		We do this in an atomic pthread_mutex operation to not affect others threads
@@ -3938,8 +4202,27 @@ void *thread_process_bsgs(void *vargp)	{
 		pthread_mutex_unlock(&bsgs_thread);
 #endif
 
-		if(base_key.IsGreaterOrEqual(&n_range_end))
+		static int t0_basekey_prints = 0;
+		if(thread_number == 0 && t0_basekey_prints < 50) {
+			char* bk = base_key.GetBase16();
+			char* re = n_range_end.GetBase16();
+			printf("[BSGS][T0] base_key=0x%s range_end=0x%s\n", bk, re);
+			fflush(stdout);
+			free(bk);
+			free(re);
+			t0_basekey_prints++;
+		}
+		if(base_key.IsGreaterOrEqual(&n_range_end)) {
+			if(thread_number == 0) {
+				printf("[BSGS][T0] break: base_key >= range_end (no work)\n");
+				fflush(stdout);
+			}
 			break;
+		}
+		if(thread_number == 0 && t0_basekey_prints <= 3) {
+			printf("[BSGS][T0] enter work: bsgs_point_number=%d cycles=%u bsgs_aux=%" PRIu64 "\n", bsgs_point_number, cycles, (uint64_t)bsgs_aux);
+			fflush(stdout);
+		}
 
 
 		if(FLAGMATRIX)	{
@@ -3962,7 +4245,6 @@ void *thread_process_bsgs(void *vargp)	{
 
 		km.Set(&base_key);
 		km.Neg();
-		
 		km.Add(&secp->order);
 		km.Sub(&intaux);
 		point_aux = secp->ComputePublicKey(&km);
@@ -3972,102 +4254,271 @@ void *thread_process_bsgs(void *vargp)	{
 				startP  = secp->AddDirect(OriginalPointsBSGS[k],point_aux);
 				j = 0;
 				while( j < cycles && bsgs_found[k]== 0 )	{
-					
+					if(FLAGGPU) {
+						#ifdef CUDA_ENABLED
+							int gpu_batch = GPU_BATCH;
+							if(gpu_batch <= 0) gpu_batch = 1;
+							uint32_t remaining = (uint32_t)(cycles - j);
+							int eff_batch = gpu_batch;
+							if((uint32_t)eff_batch > remaining) {
+								eff_batch = (int)remaining;
+								if(eff_batch <= 0) eff_batch = 1;
+							}
+							if((int)(startXB.size() / 8u) != eff_batch) {
+								startXB.resize((size_t)eff_batch * 8u);
+								startYB.resize((size_t)eff_batch * 8u);
+							}
+
+							Point sp = startP;
+							for(int bb = 0; bb < eff_batch; bb++) {
+								uint8_t xb[32];
+								uint8_t yb[32];
+								sp.x.Get32Bytes((unsigned char*)xb);
+								sp.y.Get32Bytes((unsigned char*)yb);
+								for(int li = 0; li < 8; li++) {
+									int bo = (7 - li) * 4;
+									startXB[(size_t)bb * 8u + (size_t)li] = ((uint32_t)xb[bo + 0] << 24) | ((uint32_t)xb[bo + 1] << 16) | ((uint32_t)xb[bo + 2] << 8) | ((uint32_t)xb[bo + 3]);
+									startYB[(size_t)bb * 8u + (size_t)li] = ((uint32_t)yb[bo + 0] << 24) | ((uint32_t)yb[bo + 1] << 16) | ((uint32_t)yb[bo + 2] << 8) | ((uint32_t)yb[bo + 3]);
+								}
+								sp = secp->AddDirect(sp,_2GSn);
+							}
+
+							if(keyhunt_cudaLegacyGroupCheckBatch(startXB.data(), startYB.data(), eff_batch, cuda_stepX, cuda_stepY, CPU_GRP_SIZE, cuda_bloom_d_hits, cuda_bloom_hits, GPU_THREADS, GPU_BLOCKS) != 0) {
+								fprintf(stderr,"[E] CUDA legacy group check batch failed\n");
+								exit(EXIT_FAILURE);
+							}
+							static thread_local int t0_dbg_prints = 0;
+							if(thread_number == 0 && t0_dbg_prints < 3) {
+								uint64_t hitCount = 0;
+								for(int bb = 0; bb < eff_batch; bb++) {
+									for(int ii = 0; ii < CPU_GRP_SIZE; ii++) {
+										if(cuda_bloom_hits[(size_t)bb * (size_t)CPU_GRP_SIZE + (size_t)ii]) hitCount++;
+									}
+								}
+								uint8_t x32[32];
+								int dbg_ok = keyhunt_cudaLegacyDebugFirstX(startXB.data(), startYB.data(), cuda_stepX, cuda_stepY, CPU_GRP_SIZE, x32);
+								int cpu_bloom_hit = 0;
+								int cpu_bloom_hit_cpupt = 0;
+								int cpu_gpu_x_match = 0;
+								uint8_t bucket = 0;
+								uint8_t bucket_cpupt = 0;
+								if(dbg_ok == 0) {
+									bucket = x32[0];
+									cpu_bloom_hit = bloom_check(&bloom_bP[bucket], x32, 32);
+									// Compute the expected same first point on CPU and compare X32
+									// First point in group corresponds to offset=-half => startP - half*(BSGS_MP_double)
+									Int cpu_mul;
+									cpu_mul.Set(&BSGS_M_double);
+									cpu_mul.Mult((uint64_t)(CPU_GRP_SIZE / 2));
+									Point cpu_off_tmp = secp->ComputePublicKey(&cpu_mul);
+									Point cpu_off = secp->Negation(cpu_off_tmp);
+									Point cpu_pt = secp->AddDirect(startP, cpu_off);
+									uint8_t x32_cpu[32];
+									cpu_pt.x.Get32Bytes((unsigned char*)x32_cpu);
+									cpu_gpu_x_match = (memcmp(x32_cpu, x32, 32) == 0) ? 1 : 0;
+									bucket_cpupt = x32_cpu[0];
+									cpu_bloom_hit_cpupt = bloom_check(&bloom_bP[bucket_cpupt], x32_cpu, 32);
+								}
+								int start_pack_match = 0;
+								int step_pack_match = 0;
+								{
+									uint8_t start_x_cpu[32];
+									uint8_t start_x_pack[32];
+									startP.x.Get32Bytes((unsigned char*)start_x_cpu);
+									for(int li = 0; li < 8; li++) {
+										uint32_t w = startXB[(size_t)0 * 8u + (size_t)li];
+										int bo = (7 - li) * 4;
+										start_x_pack[bo + 0] = (uint8_t)((w >> 24) & 0xFF);
+										start_x_pack[bo + 1] = (uint8_t)((w >> 16) & 0xFF);
+										start_x_pack[bo + 2] = (uint8_t)((w >> 8) & 0xFF);
+										start_x_pack[bo + 3] = (uint8_t)(w & 0xFF);
+									}
+									start_pack_match = (memcmp(start_x_cpu, start_x_pack, 32) == 0) ? 1 : 0;
+								}
+								{
+									uint8_t step_x_cpu[32];
+									uint8_t step_x_pack[32];
+									cuda_stepP.x.Get32Bytes((unsigned char*)step_x_cpu);
+									for(int li = 0; li < 8; li++) {
+										uint32_t w = cuda_stepX[li];
+										int bo = (7 - li) * 4;
+										step_x_pack[bo + 0] = (uint8_t)((w >> 24) & 0xFF);
+										step_x_pack[bo + 1] = (uint8_t)((w >> 16) & 0xFF);
+										step_x_pack[bo + 2] = (uint8_t)((w >> 8) & 0xFF);
+										step_x_pack[bo + 3] = (uint8_t)(w & 0xFF);
+									}
+									step_pack_match = (memcmp(step_x_cpu, step_x_pack, 32) == 0) ? 1 : 0;
+								}
+								int dbg_sm_ok1 = -1;
+								int dbg_sm_okHalf = -1;
+								int dbg_sm_match1 = 0;
+								int dbg_sm_matchHalf = 0;
+								uint32_t dbg_sm_fail_pow2 = 0;
+								if(dbg_ok == 0) {
+									const uint32_t half = (uint32_t)(CPU_GRP_SIZE / 2);
+									uint8_t gx1[32];
+									uint8_t gxHalf[32];
+									dbg_sm_ok1 = keyhunt_cudaLegacyDebugScalarMultX(cuda_stepX, cuda_stepY, 1u, gx1);
+									dbg_sm_okHalf = keyhunt_cudaLegacyDebugScalarMultX(cuda_stepX, cuda_stepY, half, gxHalf);
+									if(dbg_sm_ok1 == 0) {
+										Int k1;
+										k1.SetInt32(1);
+										k1.Mult(&BSGS_M_double);
+										Point cpu1 = secp->ComputePublicKey(&k1);
+										uint8_t cpu1x[32];
+										cpu1.x.Get32Bytes((unsigned char*)cpu1x);
+										dbg_sm_match1 = (memcmp(cpu1x, gx1, 32) == 0) ? 1 : 0;
+									}
+									if(dbg_sm_okHalf == 0) {
+										Int kHalf;
+										kHalf.SetInt32((int32_t)half);
+										kHalf.Mult(&BSGS_M_double);
+										Point cpuHalf = secp->ComputePublicKey(&kHalf);
+										uint8_t cpuHalfx[32];
+										cpuHalf.x.Get32Bytes((unsigned char*)cpuHalfx);
+										dbg_sm_matchHalf = (memcmp(cpuHalfx, gxHalf, 32) == 0) ? 1 : 0;
+									}
+									// Find first failing power-of-two scalar (isolates repeated pointDouble correctness)
+									for(uint32_t kk = 1u; kk <= half; kk <<= 1u) {
+										uint8_t gxk[32];
+										if(keyhunt_cudaLegacyDebugScalarMultX(cuda_stepX, cuda_stepY, kk, gxk) != 0) {
+											dbg_sm_fail_pow2 = kk;
+											break;
+										}
+										Int kcpu;
+										kcpu.SetInt32((int32_t)kk);
+										kcpu.Mult(&BSGS_M_double);
+										Point cpup = secp->ComputePublicKey(&kcpu);
+										uint8_t cpu_x[32];
+										cpup.x.Get32Bytes((unsigned char*)cpu_x);
+										if(memcmp(cpu_x, gxk, 32) != 0) {
+											dbg_sm_fail_pow2 = kk;
+											break;
+										}
+									}
+								}
+								printf("[BSGS][T0][GPU] cycles=%u j=%u eff_batch=%d hits=%" PRIu64 " dbg_ok=%d bucket=%u cpu_bloom=%d xmatch=%d bucket_cpu=%u cpu_bloom_cpu=%d start_pack=%d step_pack=%d\n",
+								       cycles, j, eff_batch, hitCount, dbg_ok, (unsigned)bucket, cpu_bloom_hit,
+								       cpu_gpu_x_match, (unsigned)bucket_cpupt, cpu_bloom_hit_cpupt,
+								       start_pack_match, step_pack_match);
+								if(dbg_ok == 0) {
+									printf("[BSGS][T0][GPU][SM] ok1=%d match1=%d okHalf=%d matchHalf=%d half=%u fail_pow2=%u\n",
+									       dbg_sm_ok1, dbg_sm_match1, dbg_sm_okHalf, dbg_sm_matchHalf,
+									       (uint32_t)(CPU_GRP_SIZE / 2), dbg_sm_fail_pow2);
+									fflush(stdout);
+								}
+								fflush(stdout);
+								t0_dbg_prints++;
+							}
+
+							for(int bb = 0; bb < eff_batch && bsgs_found[k]== 0; bb++) {
+								for(int ii = 0; ii < CPU_GRP_SIZE && bsgs_found[k]== 0; ii++) {
+									uint8_t h = cuda_bloom_hits[(size_t)bb * (size_t)CPU_GRP_SIZE + (size_t)ii];
+									if(!h) continue;
+									r = bsgs_secondcheck(&base_key,(((j + (uint32_t)bb)*1024) + ii),k,&keyfound);
+									if(r)	{
+										hextemp = keyfound.GetBase16();
+										printf("[+] Thread Key found privkey %s   \n",hextemp);
+										point_found = secp->ComputePublicKey(&keyfound);
+										aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
+										printf("[+] Publickey %s\n",aux_c);
+										
+										#if defined(_WIN64) && !defined(__CYGWIN__)
+										WaitForSingleObject(write_keys, INFINITE);
+										#else
+										pthread_mutex_lock(&write_keys);
+										#endif
+										filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
+										if(filekey != NULL)	{
+											fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
+											fclose(filekey);
+										}
+										free(hextemp);
+										free(aux_c);
+										#if defined(_WIN64) && !defined(__CYGWIN__)
+										ReleaseMutex(write_keys);
+										#else
+										pthread_mutex_unlock(&write_keys);
+										#endif
+										bsgs_found[k] = 1;
+										salir = 1;
+										for(l = 0; l < bsgs_point_number && salir; l++)	{
+											salir &= bsgs_found[l];
+										}
+										if(salir)	{
+											printf("All points were found\n");
+											exit(EXIT_FAILURE);
+										}
+									} //End if second check
+								}//ii
+							} //bb
+							for(int bb = 0; bb < eff_batch; bb++) {
+								startP = secp->AddDirect(startP,_2GSn);
+							}
+							j += (uint32_t)eff_batch;
+							continue;
+						#else
+							fprintf(stderr,"[E] Internal error: FLAGGPU set without CUDA_ENABLED\n");
+							exit(EXIT_FAILURE);
+						#endif
+					}
 					for(i = 0; i < hLength; i++) {
 						dx[i].ModSub(&GSn[i].x,&startP.x);
 					}
 					dx[i].ModSub(&GSn[i].x,&startP.x);  // For the first point
 					dx[i+1].ModSub(&_2GSn.x,&startP.x); // For the next center point
+				}
+				dx[i].ModSub(&GSn[i].x,&startP.x);  // For the first point
+				dx[i+1].ModSub(&_2GSn.x,&startP.x); // For the next center point
 
-					// Grouped ModInv
-					grp->ModInv();
-					
-					/*
-					We use the fact that P + i*G and P - i*G has the same deltax, so the same inverse
-					We compute key in the positive and negative way from the center of the group
-					*/
+				// Grouped ModInv
+				grp->ModInv();
 
-					// center point
-					pts[CPU_GRP_SIZE / 2] = startP;
-					
-					for(i = 0; i<hLength; i++) {
-
-						pp = startP;
-						pn = startP;
-
-						// P = startP + i*G
-						dy.ModSub(&GSn[i].y,&pp.y);
-
-						_s.ModMulK1(&dy,&dx[i]);        // s = (p2.y-p1.y)*inverse(p2.x-p1.x);
-						_p.ModSquareK1(&_s);            // _p = pow2(s)
-
-						pp.x.ModNeg();
-						pp.x.ModAdd(&_p);
-						pp.x.ModSub(&GSn[i].x);           // rx = pow2(s) - p1.x - p2.x;
-						
-#if 0
-  pp.y.ModSub(&GSn[i].x,&pp.x);
-  pp.y.ModMulK1(&_s);
-  pp.y.ModSub(&GSn[i].y);           // ry = - p2.y - s*(ret.x-p2.x);  
-#endif
-
-						// P = startP - i*G  , if (x,y) = i*G then (x,-y) = -i*G
-						dyn.Set(&GSn[i].y);
-						dyn.ModNeg();
-						dyn.ModSub(&pn.y);
-
-						_s.ModMulK1(&dyn,&dx[i]);       // s = (p2.y-p1.y)*inverse(p2.x-p1.x);
-						_p.ModSquareK1(&_s);            // _p = pow2(s)
-
-						pn.x.ModNeg();
-						pn.x.ModAdd(&_p);
-						pn.x.ModSub(&GSn[i].x);          // rx = pow2(s) - p1.x - p2.x;
-
-#if 0
-  pn.y.ModSub(&GSn[i].x,&pn.x);
-  pn.y.ModMulK1(&_s);
-  pn.y.ModAdd(&GSn[i].y);          // ry = - p2.y - s*(ret.x-p2.x);  
-#endif
-
-
-						pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
-						pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
-
-					}
-
-					// First point (startP - (GRP_SZIE/2)*G)
+				// center point
+				pts[CPU_GRP_SIZE / 2] = startP;
+				
+				for(i = 0; i<hLength; i++) {
+					pp = startP;
 					pn = startP;
+
+					// P = startP + i*G
+					dy.ModSub(&GSn[i].y,&pp.y);
+					_s.ModMulK1(&dy,&dx[i]);
+					_p.ModSquareK1(&_s);
+					pp.x.ModNeg();
+					pp.x.ModAdd(&_p);
+					pp.x.ModSub(&GSn[i].x);
+
+					// P = startP - i*G
 					dyn.Set(&GSn[i].y);
 					dyn.ModNeg();
 					dyn.ModSub(&pn.y);
-
 					_s.ModMulK1(&dyn,&dx[i]);
 					_p.ModSquareK1(&_s);
-
 					pn.x.ModNeg();
 					pn.x.ModAdd(&_p);
 					pn.x.ModSub(&GSn[i].x);
 
-#if 0
-pn.y.ModSub(&GSn[i].x,&pn.x);
-pn.y.ModMulK1(&_s);
-pn.y.ModAdd(&GSn[i].y);
-#endif
+					pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
+					pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
+				}
 
-					pts[0] = pn;
-					
-					for(int i = 0; i<CPU_GRP_SIZE && bsgs_found[k]== 0; i++) {
-						pts[i].x.Get32Bytes((unsigned char*)xpoint_raw);
+				// First point (startP - (GRP_SZIE/2)*G)
+				pn = startP;
+				dyn.Set(&GSn[i].y);
+				dyn.ModNeg();
+				dyn.ModSub(&pn.y);
+				_s.ModMulK1(&dyn,&dx[i]);
+				_p.ModSquareK1(&_s);
+				pn.x.ModNeg();
+				pn.x.ModAdd(&_p);
+				pn.x.ModSub(&GSn[i].x);
+				pts[0] = pn;
+					for(int ii = 0; ii<CPU_GRP_SIZE && bsgs_found[k]== 0; ii++) {
+						pts[ii].x.Get32Bytes((unsigned char*)xpoint_raw);
 						r = bloom_check(&bloom_bP[((unsigned char)xpoint_raw[0])],xpoint_raw,32);
 						if(r) {
-							if(FLAGDEBUG)	{
-								hextemp = tohex(xpoint_raw,32);
-								aux_c = base_key.GetBase16();
-								printf("[D] %s pass the bloom filter check %4i %i, base %s\n",hextemp,i,j,aux_c);
-								free(hextemp);
-								free(aux_c);
-							}
-							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
+							r = bsgs_secondcheck(&base_key,((j*1024) + ii),k,&keyfound);
 							if(r)	{
 								hextemp = keyfound.GetBase16();
 								printf("[+] Thread Key found privkey %s   \n",hextemp);
@@ -4079,7 +4530,6 @@ pn.y.ModAdd(&GSn[i].y);
 #else
 								pthread_mutex_lock(&write_keys);
 #endif
-
 								filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
 								if(filekey != NULL)	{
 									fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
@@ -4103,32 +4553,30 @@ pn.y.ModAdd(&GSn[i].y);
 								}
 							} //End if second check
 						}//End if first check
-						
-					}// For for pts variable
-					
-					// Next start point (startP += (bsSize*GRP_SIZE).G)
-					
+					}
 					pp = startP;
 					dy.ModSub(&_2GSn.y,&pp.y);
-
 					_s.ModMulK1(&dy,&dx[i + 1]);
 					_p.ModSquareK1(&_s);
-
 					pp.x.ModNeg();
 					pp.x.ModAdd(&_p);
 					pp.x.ModSub(&_2GSn.x);
-
 					pp.y.ModSub(&_2GSn.x,&pp.x);
 					pp.y.ModMulK1(&_s);
 					pp.y.ModSub(&_2GSn.y);
 					startP = pp;
-					
 					j++;
-				} //while all the aMP points
-			}// End if 
+				}
+			}
+			steps[thread_number]+=2;
 		}
-		steps[thread_number]+=2;
-	}while(1);
+	#ifdef CUDA_ENABLED
+	if(FLAGGPU) {
+		keyhunt_cudaBloomBatchFree(cuda_bloom_d_values, cuda_bloom_d_hits);
+	}
+	#endif
+	if(cuda_bloom_values) free(cuda_bloom_values);
+	if(cuda_bloom_hits) free(cuda_bloom_hits);
 	ends[thread_number] = 1;
 	return NULL;
 }
@@ -4294,7 +4742,6 @@ void *thread_process_bsgs_random(void *vargp)	{
 
 						pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
 						pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
-
 					}
 
 					// First point (startP - (GRP_SZIE/2)*G)
