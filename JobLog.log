@@ -119,3 +119,13 @@
 ## 푸시 완료 (2026-01-01 17:59)
 - collaborator 권한 부여 후 푸시 성공
 - 전체 프로젝트 히스토리 업로드 완료
+
+=== .windsurf 디렉토리 제거 (2026-01-04 23:28) ===
+
+## 작업 내용
+- git에서 .windsurf 디렉토리 제거
+- 명령어: git rm -r .windsurf
+- 제거된 파일: .windsurf/workflows/command.md
+
+## 결과
+✅ .windsurf 디렉토리가 git tracking에서 성공적으로 제거됨

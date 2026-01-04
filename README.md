@@ -261,6 +261,7 @@ keyhunt/
 
 - 원본 [keyhunt](https://github.com/albertobsd/keyhunt) by albertobsd
 - Apple Silicon 최적화 by [@consigcody94](https://github.com/consigcody94)
+- CUDA 최적화 by [@ChoRongChoRong](https://github.com/moonlightpark)
 
 ## 📜 라이선스
 
