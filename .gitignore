@@ -4,9 +4,18 @@ hexcharstoraw
 *.bin
 KEYFOUNDKEYFOUND.txt
 VANITYKEYFOUND.txt
+JobLog.md
 *.dat
 *.tbl
 *.blm
+
+.gitignore
+
+.windsurf*
+.windsurf/**
+
+KEYFOUNDKEYFOUND*
+VANITYKEYFOUND*
 
 # CMake build directories
 build/

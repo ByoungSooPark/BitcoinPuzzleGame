@@ -1,0 +1,21 @@
+[+] Version 0.2.230519 Satoshi Quest (legacy), developed by AlbertoBSD
+[+] Threads : 10
+[+] Stats output every 3 seconds
+[+] Mode BSGS sequential
+[+] Opening file tests/66.txt
+[+] Added 1 points from file
+[+] Range 
+[+] -- from : 0x20000000000000000
+[+] -- to   : 0x3ffffffffffffffff
+[BSGS] KFACTOR=1 BSGS_M=4194304 BSGS_N=17592186044416 bsgs_aux=4194304 expected_cycles=4096
+[+] N = 0x100000000000
+[+] Bloom filter for 4194304 elements : 14.38 MB
+[+] Bloom filter for 131072 elements : 0.88 MB
+[+] Bloom filter for 4096 elements : 0.88 MB
+[+] Allocating 0.00 MB for 4096 bP Points
+[+] processing 0/4194304 bP points : 0%[+] processing 0/4194304 bP points : 0%[+] processing 1048576/4194304 bP points : 25%[+] processing 2097152/4194304 bP points : 50%[+] processing 3145728/4194304 bP points : 75%[+] processing 4194304/4194304 bP points : 100%     
+[+] Making checkums .. ... done
+[+] Sorting 4096 elements... Done!
+[+] Thread 0x20000000000000000   [BSGS][T0] base_key=0x20000200000000000 range_end=0x3ffffffffffffffff
+[BSGS][T0] enter work: bsgs_point_number=1 cycles=4096 bsgs_aux=4194304
+[+] Thread 0x20000200000000000   [+] Thread 0x20000400000000000   [+] Thread 0x20000600000000000   [+] Thread 0x20000800000000000   [+] Thread 0x20000a00000000000   [+] Thread 0x20000c00000000000   [+] Thread 0x20000e00000000000   [+] Thread 0x20001000000000000   [+] Thread 0x20001200000000000   [+] Total 0 keys in 3 seconds: 0 keys/s[+] Total 0 keys in 6 seconds: 0 keys/s[+] Total 0 keys in 9 seconds: 0 keys/s[+] Total 0 keys in 12 seconds: 0 keys/s[+] Total 0 keys in 15 seconds: 0 keys/s[+] Total 0 keys in 18 seconds: 0 keys/s[+] Total 0 keys in 21 seconds: 0 keys/s[+] Total 0 keys in 24 seconds: 0 keys/s[+] Total 0 keys in 27 seconds: 0 keys/s

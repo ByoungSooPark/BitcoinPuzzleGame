@@ -94,3 +94,28 @@
 ⚠️ **CPU 비교를 위해서는 더 긴 실행 시간 필요**
 - 최소 30-60초 이상 권장
 - 또는 작은 범위로 빠른 초기화 테스트
+
+=== Git 커밋 준비 완료 (2026-01-01 17:55) ===
+
+## 커밋된 파일
+1. verify_gpu_bsgs.sh - GPU BSGS 검증 스크립트
+2. JobLog.log - 오류 분석 및 해결 과정
+
+## 커밋 메시지
+"GPU BSGS 검증 스크립트 추가 및 테스트 완료
+- verify_gpu_bsgs.sh: GPU vs CPU BSGS 성능 비교 스크립트
+- RTX 3060에서 ~23 Tkeys/s 성능 확인
+- CUDA 가속 정상 작동 검증
+- JobLog.log: 오류 분석 및 해결 과정 기록"
+
+## GitHub 푸시 상태
+- 로컬 커밋 완료: ✅
+- 원격 푸시: ✅ 성공
+- 현재 계정: moonlightpark
+- 대상 저장소: ByoungSooPark/BitcoinPuzzleGame.git
+- 브랜치: main (새 브랜치 생성)
+- 업로드: 799 objects, 912.15 KiB
+
+## 푸시 완료 (2026-01-01 17:59)
+- collaborator 권한 부여 후 푸시 성공
+- 전체 프로젝트 히스토리 업로드 완료

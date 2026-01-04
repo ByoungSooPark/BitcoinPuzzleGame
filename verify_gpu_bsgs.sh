@@ -8,7 +8,6 @@ echo ""
 TEST_RANGE_START="20000000000000000"
 TEST_RANGE_END="3ffffffffffffffff"
 
-cd /home/park/projects/make_bitcoin_address/keyhuntM1CPU
 
 echo "1. CPU 모드로 15초 실행..."
 timeout 30 ./build/keyhunt -m bsgs -f tests/66.txt -r ${TEST_RANGE_START}:${TEST_RANGE_END} -t 10 -s 3 2>&1 | tee ./cpu_test.log &

@@ -1,0 +1,72 @@
+[+] Version 0.2.230519 Satoshi Quest (legacy), developed by AlbertoBSD
+[+] Thread : 1
+[+] Stats output every 3 seconds
+[CUDA] Using device: NVIDIA GeForce RTX 3060
+[CUDA] Compute capability: 8.6
+[CUDA] Multiprocessors: 28
+[CUDA] Max threads per block: 1024
+[CUDA] Total global memory: 11.76 GB
+[CUDA] Enabled (device=0 threads=256 blocks=0)
+[CUDA] Batch=16
+[+] Mode BSGS sequential
+[+] Opening file tests/66.txt
+[+] Added 1 points from file
+[+] Range 
+[+] -- from : 0x20000000000000000
+[+] -- to   : 0x3ffffffffffffffff
+[BSGS] KFACTOR=1 BSGS_M=4194304 BSGS_N=17592186044416 bsgs_aux=4194304 expected_cycles=4096
+[+] N = 0x100000000000
+[+] Bloom filter for 4194304 elements : 14.38 MB
+[+] Bloom filter for 131072 elements : 0.88 MB
+[+] Bloom filter for 4096 elements : 0.88 MB
+[+] Allocating 0.00 MB for 4096 bP Points
+[+] processing 0/4194304 bP points : 0%[+] processing 0/4194304 bP points : 0%[+] processing 1048576/4194304 bP points : 25%[+] processing 2097152/4194304 bP points : 50%[+] processing 3145728/4194304 bP points : 75%[+] processing 4194304/4194304 bP points : 100%     
+[+] Making checkums .. ... done
+[CUDA] Bloom filter uploaded (256 x 0.06 MB)
+[DEBUG] Y2_ok=1 S_ok=1 M_ok=1
+[DEBUG] Y2.limbs[0]=0x8d0fba9e (expect 0x8d0fba9e)
+[DEBUG] S.limbs[0]=0x770afacf (expect 0x770afacf)
+[DEBUG] M.limbs[0]=0x28fef8ac (expect 0x28fef8ac)
+[DEBUG] Jacobian X' = e4bb45c7a7752314b72017f71d414998314729ad88bcb1c34acba64198ef4ad7
+[DEBUG] Expected X' = e4bb45c7a7752314b72017f71d414998314729ad88bcb1c34acba64198ef4ad7
+[DEBUG] Jacobian Y' = 633499139e2fcf82ce6864b001721e2ffa58a9355b68f6d36533ee4d88b016da
+[DEBUG] Expected Y' = 633499139e2fcf82ce6864b001721e2ffa58a9355b68f6d36533ee4d88b016da
+[DEBUG] Computed affine 2G.x = 16c6f9e5c80e994548060f8478a5147aa81d5962e7280dacc6ec4ebbbe1c6325
+[DEBUG] Computed affine 2G.y = 5a5cf285f9a029c23bf48c3521261623f36a66566a6e55472059041ef649298e
+[CUDA][TEST] modMul 2*3: ok=1 result=2366618270 (expected 6)
+[CUDA][TEST] modMul 0xFFFFFFFF^2: ok=1 limbs[0]=770afacf limbs[1]=28fef8ac (expected 00000001 fffffffe)
+[CUDA][TEST] modMul 2^128*2^128 (reduction): ok=-1729148201 limbs[0]=4acba641 limbs[1]=88bcb1c3 (expected 000003d1 00000001)
+[CUDA][TEST] Gy load: ok=826747309 limbs[0]=1d414998 (expected fb10d4b8)
+[CUDA][TEST] modInv(2): 2*inv(2)=1 test1=1 test2=1 result=0x00000001
+[CUDA][TEST] modInv(Z): Z*inv(Z)=1 test=1
+[CUDA][TEST] pointDouble(G)->2G: x_match=1 y_match=1
+[CUDA][TEST] ✅ pointDouble PASSED!
+[+] Sorting 4096 elements... Done!
+[BSGS][T0] base_key=0x20000000000000000 range_end=0x3ffffffffffffffff
+[BSGS][T0] enter work: bsgs_point_number=1 cycles=4096 bsgs_aux=4194304
+[+] Thread 0x20000000000000000   [BSGS][T0][GPU] cycles=4096 j=0 eff_batch=16 hits=0 dbg_ok=0 bucket=26 cpu_bloom=0 xmatch=1 bucket_cpu=26 cpu_bloom_cpu=0 start_pack=1 step_pack=1
+[BSGS][T0][GPU][SM] ok1=0 match1=1 okHalf=0 matchHalf=1 half=512 fail_pow2=0
+[BSGS][T0][GPU] cycles=4096 j=16 eff_batch=16 hits=0 dbg_ok=0 bucket=28 cpu_bloom=0 xmatch=1 bucket_cpu=28 cpu_bloom_cpu=0 start_pack=1 step_pack=1
+[BSGS][T0][GPU][SM] ok1=0 match1=1 okHalf=0 matchHalf=1 half=512 fail_pow2=0
+[BSGS][T0][GPU] cycles=4096 j=32 eff_batch=16 hits=0 dbg_ok=0 bucket=102 cpu_bloom=0 xmatch=1 bucket_cpu=102 cpu_bloom_cpu=0 start_pack=1 step_pack=1
+[BSGS][T0][GPU][SM] ok1=0 match1=1 okHalf=0 matchHalf=1 half=512 fail_pow2=0
+[BSGS][T0] base_key=0x20000200000000000 range_end=0x3ffffffffffffffff
+[BSGS][T0] enter work: bsgs_point_number=1 cycles=4096 bsgs_aux=4194304
+[+] Thread 0x20000200000000000   [BSGS][T0] base_key=0x20000400000000000 range_end=0x3ffffffffffffffff
+[BSGS][T0] enter work: bsgs_point_number=1 cycles=4096 bsgs_aux=4194304
+[+] Thread 0x20000400000000000   [CUDA] legacyGroupCheck calls=561 (+561) points=9191424 (+9191424)
+[CUDA] legacyGroupCheck avg_us_per_call total=5206.95 interval=5206.95
+[+] Total 70368744177664 keys in 3 seconds: ~23 Tkeys/s (23456248059221 keys/s)[BSGS][T0] base_key=0x20000600000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20000600000000000   [BSGS][T0] base_key=0x20000800000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20000800000000000   [CUDA] legacyGroupCheck calls=1132 (+571) points=18546688 (+9355264)
+[CUDA] legacyGroupCheck avg_us_per_call total=5210.65 interval=5214.29
+[+] Total 140737488355328 keys in 6 seconds: ~23 Tkeys/s (23456248059221 keys/s)[BSGS][T0] base_key=0x20000a00000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20000a00000000000   [BSGS][T0] base_key=0x20000c00000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20000c00000000000   [CUDA] legacyGroupCheck calls=1701 (+569) points=27869184 (+9322496)
+[CUDA] legacyGroupCheck avg_us_per_call total=5215.60 interval=5225.43
+[+] Total 211106232532992 keys in 9 seconds: ~23 Tkeys/s (23456248059221 keys/s)[BSGS][T0] base_key=0x20000e00000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20000e00000000000   [BSGS][T0] base_key=0x20001000000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20001000000000000   [CUDA] legacyGroupCheck calls=2268 (+567) points=37158912 (+9289728)
+[CUDA] legacyGroupCheck avg_us_per_call total=5221.89 interval=5240.78
+[+] Total 281474976710656 keys in 12 seconds: ~23 Tkeys/s (23456248059221 keys/s)[BSGS][T0] base_key=0x20001200000000000 range_end=0x3ffffffffffffffff
+[+] Thread 0x20001200000000000   
